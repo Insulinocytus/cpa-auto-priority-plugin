@@ -21,6 +21,9 @@ type managementStore struct {
 	files          []map[string]any
 	usage          map[string][]string
 	upstreamStatus map[string]int
+	cards          map[string][]string
+	cardStatus     map[string]int
+	cardQueryCount map[string]int
 	queryCount     map[string]int
 	writeCount     map[string]int
 	writeFailure   map[string]bool
@@ -36,7 +39,7 @@ type managementStore struct {
 }
 
 func store(files ...map[string]any) *managementStore {
-	return &managementStore{files: files, usage: map[string][]string{}, upstreamStatus: map[string]int{}, queryCount: map[string]int{}, writeCount: map[string]int{}, writeFailure: map[string]bool{}, key: "management-secret"}
+	return &managementStore{files: files, usage: map[string][]string{}, cards: map[string][]string{}, cardStatus: map[string]int{}, cardQueryCount: map[string]int{}, upstreamStatus: map[string]int{}, queryCount: map[string]int{}, writeCount: map[string]int{}, writeFailure: map[string]bool{}, key: "management-secret"}
 }
 
 func credential(name, provider string) map[string]any {
@@ -77,15 +80,38 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 		if err := json.NewDecoder(req.Body).Decode(&call); err != nil {
 			return nil, err
 		}
-		if call.Method != "GET" || call.URL != "https://chatgpt.com/backend-api/wham/usage" || call.Header["Authorization"] != "Bearer $TOKEN$" || call.ProxyURL != nil {
+		isCard := call.URL == "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+		if call.Method != "GET" || (!isCard && call.URL != "https://chatgpt.com/backend-api/wham/usage") || call.Header["Authorization"] != "Bearer $TOKEN$" || call.ProxyURL != nil {
 			return jsonResponse(400, map[string]any{"error": "invalid query contract"}), nil
 		}
 		for _, file := range s.files {
 			if file["auth_index"] == call.AuthIndex {
 				s.selectedProxy, _ = file["proxy_url"].(string)
+				if token, ok := file["id_token"].(map[string]any); ok && call.Header["Chatgpt-Account-Id"] != token["chatgpt_account_id"] {
+					return jsonResponse(400, map[string]any{"error": "wrong selected account"}), nil
+				}
 			}
 		}
 		s.accountID = call.Header["Chatgpt-Account-Id"]
+		if isCard {
+			if call.Header["OpenAI-Beta"] != "codex-1" || call.Header["Originator"] != "Codex Desktop" || call.Header["Accept"] != "application/json" {
+				return jsonResponse(400, map[string]any{"error": "invalid card contract"}), nil
+			}
+			index := s.cardQueryCount[call.AuthIndex]
+			s.cardQueryCount[call.AuthIndex]++
+			responses := s.cards[call.AuthIndex]
+			if len(responses) == 0 {
+				responses = []string{`{"credits":[],"available_count":0,"applicable_available_count":0}`}
+			}
+			if index >= len(responses) {
+				index = len(responses) - 1
+			}
+			status := s.cardStatus[call.AuthIndex]
+			if status == 0 {
+				status = 200
+			}
+			return jsonResponse(200, map[string]any{"status_code": status, "body": responses[index]}), nil
+		}
 		index := s.queryCount[call.AuthIndex]
 		s.queryCount[call.AuthIndex]++
 		if s.disableOnQuery {
@@ -498,5 +524,228 @@ func TestSyncEquivalentFractionalInstantsShareRank(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestSyncCardQueryFailureIsolation(t *testing.T) {
+	valid := `{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"reset_at":"2026-10-10T00:00:00Z"}}}`
+	empty := `{"credits":[],"available_count":0,"applicable_available_count":0}`
+	for _, tc := range []struct {
+		name                   string
+		responses              []string
+		status                 int
+		wantPriority, attempts int
+		query                  string
+	}{
+		{"confirmed-empty", []string{empty}, 200, 0, 1, "ok"},
+		{"incomplete-details", []string{`{"available_count":2,"credits":[{"reset_type":"codex_rate_limits","status":"available","granted_at":"2026-10-01T00:00:00Z","expires_at":"2026-10-05T00:00:00Z"}]}`}, 200, -1, 2, "reset_card_details_incomplete"},
+		{"unknown-scope", []string{`{"available_count":1,"credits":[{"reset_type":"future_scope","status":"available","granted_at":"2026-10-01T00:00:00Z","expires_at":"2026-10-05T00:00:00Z"}]}`}, 200, -1, 2, "reset_card_applicability_unknown"},
+		{"nonexpiring", []string{`{"available_count":1,"credits":[{"reset_type":"codex_rate_limits","status":"available","granted_at":"2026-10-01T00:00:00Z"}]}`}, 200, 0, 1, "ok"},
+		{"recovered-malformed", []string{`{}`, empty}, 200, 0, 2, "ok"},
+		{"malformed", []string{`{"credits":null}`}, 200, -1, 2, "reset_card_response_malformed"},
+		{"failed", []string{`{"error":"sensitive-card-token"}`}, 503, -1, 2, "upstream_http_failed"},
+		{"invalid-credentials", []string{empty}, 401, -1, 1, "credentials_invalid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := store(credential("candidate", "codex"), credential("healthy", "codex"))
+			s.usage["candidate"], s.usage["healthy"] = []string{valid}, []string{valid}
+			s.cards["candidate"], s.cardStatus["candidate"] = tc.responses, tc.status
+			round, err := synchronizer(t, s).Sync(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if s.files[0]["priority"] != tc.wantPriority || s.files[1]["priority"] != 0 || round.Results[0].QueryStatus != tc.query || s.cardQueryCount["candidate"] != tc.attempts || s.cardQueryCount["healthy"] != 1 || s.queryCount["candidate"] != 1 || s.queryCount["healthy"] != 1 {
+				t.Fatalf("state=%v results=%+v usage=%v cards=%v", s.files, round.Results, s.queryCount, s.cardQueryCount)
+			}
+			encoded, _ := json.Marshal(round)
+			if strings.Contains(string(encoded), "sensitive-card-token") {
+				t.Fatal("card query leaked upstream body")
+			}
+		})
+	}
+}
+
+// Synthetic dates in the OpenAI backend-client reset-credit fixture shape.
+func resetCredit(kind, status, granted string, expires any) map[string]any {
+	return map[string]any{"id": "fixture-credit", "reset_type": kind, "status": status, "granted_at": granted, "expires_at": expires}
+}
+
+func resetCards(credits ...map[string]any) string {
+	available := 0
+	for _, credit := range credits {
+		if credit["status"] == "available" {
+			available++
+		}
+	}
+	if credits == nil {
+		credits = []map[string]any{}
+	}
+	body, _ := json.Marshal(map[string]any{"available_count": available, "applicable_available_count": 0, "credits": credits})
+	return string(body)
+}
+
+func TestSyncValidResetCardsRankBeforeLimitAndPreserveAuth(t *testing.T) {
+	grant := "2026-10-01T00:00:00Z"
+	card := func(expiry string) map[string]any {
+		return resetCredit("codex_rate_limits", "available", grant, expiry)
+	}
+	for _, names := range [][]string{{"early", "equal", "late", "multiple", "invalid", "empty", "shorter-natural"}, {"empty", "invalid", "multiple", "late", "equal", "shorter-natural", "early"}} {
+		s := store()
+		for _, name := range names {
+			file := credential(name, "codex")
+			file["id_token"] = map[string]any{"chatgpt_account_id": "account-" + name}
+			s.files = append(s.files, file)
+			s.usage[name] = []string{`{"credits":{"balance":"99999","has_credits":true},"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"limit_window_seconds":604800,"reset_at":"2026-10-10T00:00:00Z","used_percent":1},"secondary_window":{"limit_window_seconds":18000,"reset_at":"2026-10-06T00:00:00Z"}}}`}
+		}
+		s.cards["early"] = []string{resetCards(card("2026-10-05T00:00:00Z"))}
+		s.cards["equal"] = []string{resetCards(card("2026-10-10T00:00:00Z"))}
+		s.cards["late"] = []string{resetCards(card("2026-10-11T00:00:00Z"))}
+		s.cards["multiple"] = []string{resetCards(card("2026-10-07T00:00:00Z"), card("2026-10-05T00:00:00Z"), card("2026-10-11T00:00:00Z"))}
+		s.cards["invalid"] = []string{resetCards(
+			card("2026-10-03T00:00:00Z"),
+			card("2026-10-04T00:00:00Z"),
+			resetCredit("codex_rate_limits", "available", "2026-10-05T00:00:00Z", "2026-10-08T00:00:00Z"),
+			resetCredit("codex_rate_limits", "redeemed", grant, "2026-10-05T00:00:00Z"),
+			resetCredit("codex_rate_limits", "redeeming", grant, "2026-10-05T00:00:00Z"),
+			resetCredit("codex_rate_limits", "available", grant, nil),
+		)}
+		s.usage["shorter-natural"] = []string{`{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"reset_at":"2026-10-10T00:00:00Z"},"secondary_window":{"limit_window_seconds":18000,"reset_at":"2026-10-04T12:00:00Z"}}}`}
+		s.cards["shorter-natural"] = s.cards["early"]
+		s.refresh = true
+		before := map[string]map[string]any{}
+		for _, file := range s.files {
+			copy := map[string]any{}
+			for k, v := range file {
+				copy[k] = v
+			}
+			copy["access_token"] = "concurrently-refreshed-token"
+			before[file["name"].(string)] = copy
+		}
+		round, err := synchronizer(t, s).Sync(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := map[string]int{"early": 1, "multiple": 1, "shorter-natural": 2, "equal": 0, "late": 0, "invalid": 0, "empty": 0}
+		for _, result := range round.Results {
+			before[result.Name]["priority"] = want[result.Name]
+			if result.Priority != want[result.Name] || result.QueryStatus != "ok" || result.WriteStatus != "acknowledged" || result.Persistence != "unverified" {
+				t.Fatalf("unexpected card ranks: %+v", round.Results)
+			}
+		}
+		for _, file := range s.files {
+			if !reflect.DeepEqual(file, before[file["name"].(string)]) {
+				t.Fatalf("card synchronization overwrote auth: %v", file)
+			}
+		}
+	}
+}
+
+func TestSyncResetCardsCannotCrossPeriodsOrCreateMissingLayer(t *testing.T) {
+	s := store(credential("month-earlier", "codex"), credential("month-card", "codex"), credential("month-natural", "codex"), credential("month-only-card", "codex"), credential("month-only", "codex"), credential("day-card", "codex"))
+	s.usage["month-earlier"] = []string{`{"rate_limit":{"primary_window":{"limit_window_seconds":2592000,"reset_at":"2026-10-19T00:00:00Z"},"secondary_window":{"limit_window_seconds":604800,"reset_at":"2026-10-30T00:00:00Z"}}}`}
+	s.usage["month-card"] = []string{`{"rate_limit":{"primary_window":{"limit_window_seconds":2592000,"reset_at":"2026-10-20T00:00:00Z"},"secondary_window":{"limit_window_seconds":604800,"reset_at":"2026-10-10T00:00:00Z"}}}`}
+	s.usage["month-natural"] = []string{`{"rate_limit":{"primary_window":{"limit_window_seconds":2592000,"reset_at":"2026-10-20T00:00:00Z"},"secondary_window":{"limit_window_seconds":604800,"reset_at":"2026-10-08T00:00:00Z"}}}`}
+	s.usage["month-only-card"] = []string{`{"rate_limit":{"primary_window":{"limit_window_seconds":2592000,"reset_at":"2026-10-20T00:00:00Z"}}}`}
+	s.usage["month-only"] = s.usage["month-only-card"]
+	s.usage["day-card"] = []string{`{"rate_limit":{"primary_window":{"limit_window_seconds":86400,"reset_at":"2026-10-20T00:00:00Z"}}}`}
+	for _, name := range []string{"month-card", "month-only-card", "day-card"} {
+		s.cards[name] = []string{resetCards(resetCredit("codex_rate_limits", "available", "2026-10-01T00:00:00Z", "2026-10-05T00:00:00Z"))}
+	}
+	round, err := synchronizer(t, s).Sync(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{"month-earlier": 3, "month-card": 2, "month-natural": 1, "month-only-card": 0, "month-only": 0, "day-card": 0}
+	for _, result := range round.Results {
+		if result.Priority != want[result.Name] || result.QueryStatus != "ok" {
+			t.Fatalf("cross-period card assignment: %+v", round.Results)
+		}
+	}
+}
+
+func TestSyncMissingResetCardDataIsNotConfirmedAbsence(t *testing.T) {
+	for _, body := range []string{
+		`{"available_count":1,"credits":[]}`,
+		`{"credits":[]}`,
+		`{"available_count":1,"credits":[{"status":"available","granted_at":"2026-10-01T00:00:00Z","expires_at":"2026-10-05T00:00:00Z"}]}`,
+		`{"available_count":1,"credits":[{"reset_type":"codex_rate_limits","granted_at":"2026-10-01T00:00:00Z","expires_at":"2026-10-05T00:00:00Z"}]}`,
+		`{"available_count":1,"credits":[{"reset_type":"codex_rate_limits","status":"available","expires_at":"2026-10-05T00:00:00Z"}]}`,
+		`{"available_count":1,"credits":[{"reset_type":"codex_rate_limits","status":"available","granted_at":"2026-10-01T00:00:00Z","expires_at":"invalid-sensitive-date"}]}`,
+	} {
+		s := store(credential("candidate", "codex"), credential("healthy", "codex"))
+		s.usage["candidate"] = []string{`{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"reset_at":"2026-10-10T00:00:00Z"}}}`}
+		s.usage["healthy"] = s.usage["candidate"]
+		s.cards["candidate"] = []string{body}
+		round, err := synchronizer(t, s).Sync(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.files[0]["priority"] != -1 || s.files[1]["priority"] != 0 || s.cardQueryCount["candidate"] != 2 || s.queryCount["candidate"] != 1 || round.Results[0].QueryStatus == "ok" {
+			t.Fatalf("missing card data accepted: %s results=%+v", body, round.Results)
+		}
+	}
+}
+
+func TestSyncRefreshesResetCardsWithoutQuotaAmountPreference(t *testing.T) {
+	s := store(credential("card", "codex"), credential("natural", "codex"))
+	s.usage["card"] = []string{`{"rate_limit":{"allowed":true,"limit_reached":false,"primary_window":{"limit_window_seconds":604800,"reset_at":"2026-10-10T00:00:00Z","used_percent":0}}}`}
+	s.usage["natural"] = []string{`{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"reset_at":"2026-10-08T00:00:00Z"}}}`}
+	s.cards["card"] = []string{resetCards(resetCredit("codex_rate_limits", "available", "2026-10-04T00:00:00Z", "2026-10-05T00:00:00Z"))}
+	p := synchronizer(t, s)
+	if _, err := p.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if s.files[0]["priority"] != 1 || s.files[1]["priority"] != 0 {
+		t.Fatalf("card before limit: %v", s.files)
+	}
+	s.usage["card"] = []string{`{"rate_limit":{"allowed":false,"limit_reached":true,"primary_window":{"limit_window_seconds":604800,"reset_at":"2026-10-10T00:00:00Z","used_percent":100}}}`}
+	if _, err := p.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if s.files[0]["priority"] != 1 || s.files[1]["priority"] != 0 {
+		t.Fatalf("quota amount changed card ranking: %v", s.files)
+	}
+	s.cards["card"] = []string{resetCards(resetCredit("codex_rate_limits", "redeemed", "2026-10-04T00:00:00Z", "2026-10-05T00:00:00Z"))}
+	if _, err := p.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if s.files[0]["priority"] != 0 || s.files[1]["priority"] != 1 {
+		t.Fatalf("consumed card remained cached: %v", s.files)
+	}
+}
+
+func TestSyncCardManagementAuthenticationStopsBeforeWrites(t *testing.T) {
+	for _, code := range []int{401, 403} {
+		s := store(credential("candidate", "codex"), credential("unqueried", "codex"))
+		s.usage["candidate"] = []string{`{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"reset_at":"2026-10-10T00:00:00Z"}}}`}
+		failures := 0
+		client := &http.Client{Transport: transportFunc(func(req *http.Request) (*http.Response, error) {
+			if req.URL.Path == "/v8/management/requests/api-call" {
+				data, err := io.ReadAll(req.Body)
+				if err != nil {
+					return nil, err
+				}
+				req.Body = io.NopCloser(bytes.NewReader(data))
+				var call struct {
+					URL string `json:"url"`
+				}
+				if err := json.Unmarshal(data, &call); err != nil {
+					return nil, err
+				}
+				if call.URL == "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits" {
+					failures++
+					return jsonResponse(code, map[string]any{"error": "sensitive-management-token"}), nil
+				}
+			}
+			return s.RoundTrip(req)
+		})}
+		p, err := priority.New(priority.Config{ManagementURL: "http://127.0.0.1:8317", ManagementKey: s.key}, client, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		round, err := p.Sync(context.Background())
+		if err != priority.ErrManagementAuthentication || failures != 1 || len(s.writeCount) != 0 || s.queryCount["candidate"] != 1 || s.queryCount["unqueried"] != 0 || s.files[0]["priority"] != 9 || s.files[1]["priority"] != 9 {
+			t.Fatalf("management authentication failure continued work: err=%v round=%+v", err, round)
+		}
 	}
 }

@@ -13,7 +13,49 @@ import (
 )
 
 func (s *Synchronizer) codex(ctx context.Context, file authFile) ([]time.Time, string) {
+	var periods map[int64]time.Time
+	var status string
+	for range 2 {
+		periods, status = s.codexUsage(ctx, file)
+		if !retryQuery(ctx, status) {
+			break
+		}
+	}
+	if status != "ok" {
+		return nil, status
+	}
+	for range 2 {
+		status = s.codexCards(ctx, file, periods)
+		if !retryQuery(ctx, status) {
+			break
+		}
+	}
+	if status != "ok" {
+		return nil, status
+	}
+	durations := make([]int64, 0, len(periods))
+	for duration := range periods {
+		durations = append(durations, duration)
+	}
+	sort.Slice(durations, func(i, j int) bool { return durations[i] > durations[j] })
+	sequence := make([]time.Time, 0, len(durations))
+	for _, duration := range durations {
+		sequence = append(sequence, periods[duration])
+	}
+	return sequence, "ok"
+}
+
+func retryQuery(ctx context.Context, status string) bool {
+	return ctx.Err() == nil && status != "ok" && status != "no_reset_time" && status != "credentials_invalid" && status != ErrManagementAuthentication.Error()
+}
+
+func (s *Synchronizer) codexRequest(ctx context.Context, file authFile, path string) (string, string) {
 	headers := map[string]string{"Authorization": "Bearer $TOKEN$", "Content-Type": "application/json", "User-Agent": "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)"}
+	if path == "rate-limit-reset-credits" {
+		headers["Accept"] = "application/json"
+		headers["OpenAI-Beta"] = "codex-1"
+		headers["Originator"] = "Codex Desktop"
+	}
 	if file.IDToken.AccountID != "" {
 		headers["Chatgpt-Account-Id"] = file.IDToken.AccountID
 	}
@@ -22,25 +64,33 @@ func (s *Synchronizer) codex(ctx context.Context, file authFile) ([]time.Time, s
 		Method    string            `json:"method"`
 		URL       string            `json:"url"`
 		Header    map[string]string `json:"header"`
-	}{file.Index, "GET", "https://chatgpt.com/backend-api/wham/usage", headers}
+	}{file.Index, "GET", "https://chatgpt.com/backend-api/wham/" + path, headers}
 	var response struct {
 		Status int    `json:"status_code"`
 		Body   string `json:"body"`
 	}
 	if err := s.request(ctx, "POST", "requests/api-call", call, &response); err != nil {
-		return nil, err.Error()
+		return "", err.Error()
 	}
 	if response.Status == 401 {
-		return nil, "credentials_invalid"
+		return "", "credentials_invalid"
 	}
 	if response.Status < 200 || response.Status >= 300 {
-		return nil, "upstream_http_failed"
+		return "", "upstream_http_failed"
+	}
+	return response.Body, "ok"
+}
+
+func (s *Synchronizer) codexUsage(ctx context.Context, file authFile) (map[int64]time.Time, string) {
+	body, status := s.codexRequest(ctx, file, "usage")
+	if status != "ok" {
+		return nil, status
 	}
 	observed := s.now()
 	var usage struct {
 		RateLimit json.RawMessage `json:"rate_limit"`
 	}
-	payload := bytes.TrimSpace([]byte(response.Body))
+	payload := bytes.TrimSpace([]byte(body))
 	if len(payload) == 0 || payload[0] != '{' || json.Unmarshal(payload, &usage) != nil {
 		return nil, "quota_response_malformed"
 	}
@@ -104,16 +154,71 @@ func (s *Synchronizer) codex(ctx context.Context, file authFile) ([]time.Time, s
 	if len(periods) == 0 {
 		return nil, "no_reset_time"
 	}
-	durations := make([]int64, 0, len(periods))
-	for duration := range periods {
-		durations = append(durations, duration)
+	return periods, "ok"
+}
+
+func (s *Synchronizer) codexCards(ctx context.Context, file authFile, periods map[int64]time.Time) string {
+	body, status := s.codexRequest(ctx, file, "rate-limit-reset-credits")
+	if status != "ok" {
+		return status
 	}
-	sort.Slice(durations, func(i, j int) bool { return durations[i] > durations[j] })
-	sequence := make([]time.Time, 0, len(durations))
-	for _, duration := range durations {
-		sequence = append(sequence, periods[duration])
+	var payload struct {
+		Available *int64 `json:"available_count"`
+		Credits   *[]struct {
+			Type    string          `json:"reset_type"`
+			Status  string          `json:"status"`
+			Granted json.RawMessage `json:"granted_at"`
+			Expires json.RawMessage `json:"expires_at"`
+		} `json:"credits"`
 	}
-	return sequence, "ok"
+	if json.Unmarshal([]byte(body), &payload) != nil || payload.Available == nil || *payload.Available < 0 || payload.Credits == nil {
+		return "reset_card_response_malformed"
+	}
+	observed := s.now()
+	var earliest time.Time
+	available := int64(0)
+	for _, credit := range *payload.Credits {
+		if credit.Type == "" || credit.Status == "" {
+			return "reset_card_response_malformed"
+		}
+		if credit.Status != "available" {
+			continue
+		}
+		available++
+		if credit.Type != "codex_rate_limits" {
+			return "reset_card_applicability_unknown"
+		}
+		granted, err := instant(credit.Granted)
+		if err != nil {
+			return "reset_card_response_malformed"
+		}
+		// The backend's optional expiry means no expiration, not a sorting instant.
+		if len(credit.Expires) == 0 || isNull(credit.Expires) {
+			continue
+		}
+		expires, err := instant(credit.Expires)
+		if err != nil || !expires.After(granted) {
+			return "reset_card_response_malformed"
+		}
+		if granted.After(observed) || !expires.After(observed) {
+			continue
+		}
+		if earliest.IsZero() || expires.Before(earliest) {
+			earliest = expires
+		}
+	}
+	if available < *payload.Available {
+		return "reset_card_details_incomplete"
+	}
+	if available > *payload.Available {
+		return "reset_card_response_malformed"
+	}
+	// OpenAI's full banked reset covers the generic weekly and five-hour
+	// windows. No monthly or model-specific entitlement contract is published.
+	// applicable_available_count is not a held-card count; no at-limit gate.
+	applyCardExpiry(periods, 604800, earliest)
+	applyCardExpiry(periods, 18000, earliest)
+	return "ok"
 }
 
 func isNull(raw json.RawMessage) bool { return bytes.Equal(bytes.TrimSpace(raw), []byte("null")) }
