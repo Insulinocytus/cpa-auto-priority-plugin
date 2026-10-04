@@ -67,7 +67,7 @@ Authorization: Bearer <management key>
 - 首次同步前每秒只轮询宿主就绪；监听或快照结构未就绪时状态为 `waiting`，管理 401/403 则终止为 `failed`。初次 auth 加载与监听开放的顺序依据下述 pinned 普通模式源码；不把 init 的空集合报为成功。就绪后真的空集合为 `empty`，不写入；仍保持 cron，以便下一轮发现新增认证文件。
 - 首次同步与后续触发全部调用同一 `Synchronizer.Sync`，每轮重新枚举物理认证文件并取得当前额度数据，不缓存前一轮排序时间。一个后台 worker 串行执行；长轮次覆盖的触发直接跳过，结束后计算未来的下一个日历时刻，不建立队列或追赶执行。仅使用 `robfig/cron/v3` 的解析器和 `Next`，不启用其 job runner，不添加查询/写入重试。
 - 相同配置的 reconfigure 幂等；配置改变先完整验证，再取消并等待旧 generation，启动一次新的首次同步。非法配置保留旧 generation。`enabled: false` 的 reconfigure、`plugin.quiesce`、`plugin.shutdown` 和原生 shutdown 都取消并等待 worker 退出，返回后没有本实例任务继续访问宿主。
-- 宿主仅切换 disable 而不发送生命周期通知时，仍存在下述 TOCTOU 限制：定时等待无法立即获知禁用；下一轮的启用检查返回 `priority.ErrPluginNotEnabled`（`plugin_not_enabled`）后停止 worker，不再读取认证、查询额度或写入 priority。此行为不是实际共享库卸载验证。
+- 宿主仅切换 disable 而不发送生命周期通知时，仍存在下述 TOCTOU 限制：定时等待无法立即获知禁用；下一轮的启用检查返回 `priority.ErrPluginNotEnabled`（`plugin_not_enabled`）后停止 worker，不再读取认证、查询额度或写入 priority。重新启用时宿主即使发送相同配置的 reconfigure，也会启动新的首次同步；管理 401/403 后仍需修改配置。此行为不是实际共享库卸载验证。
 
 ## 固定兼容契约与证据
 
@@ -103,6 +103,6 @@ UT 使用固定时钟和有状态 HTTP transport adapter：不监听端口、不
 
 **尚未具备的验收前提：** 当前完整入口没有重置卡接入（[Codex #3](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/3)、[Claude #4](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/4)），因此不能声称已验证“卡被消费后的新排序”。接入后自动由相同入口调度；该 UT 需使用真实卡契约补齐，不用合成伪字段替代。本次不加载真实插件、不做真实宿主/账号 smoke。
 
-先前实现阶段完成过 Windows `c-shared` 编译（未加载）和无网络、受控 transport 的单轮入口运行检查。本次另外通过临时直接入口程序观察首次与 cron 的空快照、New York 春季 DST 的 23 小时间隔，以及 shutdown join；临时程序已移除。该受控运行检查不连接真实宿主，也不证明真实宿主或磁盘兼容性。
+先前实现阶段完成过 Windows `c-shared` 编译（未加载）和无网络、受控 transport 的单轮入口运行检查。本工单的调度验证只使用上述 UT，不做 smoke、真实插件加载或真实账号验证。
 
 **未验证：** 真实共享库加载、部署平台运行时 ABI、实际管理鉴权、真实账号接口、宿主内存与磁盘持久化兼容性。UT 和源码核对不能证明这些运行时性质；不安排真实宿主/账号 smoke。

@@ -9,6 +9,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	priority "github.com/Insulinocytus/cpa-auto-priority-plugin"
 )
 
 type transportFunc func(*http.Request) (*http.Response, error)
@@ -60,7 +62,20 @@ func TestStartupReconfigureOnceAndAuthenticatedStatus(t *testing.T) {
 	})}
 	p, clock := newTestRuntime(client)
 	defer p.stop()
-	p.handle("plugin.register", lifecycle(validConfig))
+	registered := p.handle("plugin.register", lifecycle(validConfig))
+	var registrationEnvelope struct {
+		OK     bool
+		Result struct {
+			SchemaVersion int `json:"schema_version"`
+			Metadata      struct{ Name string }
+			Capabilities  struct {
+				Management bool `json:"management_api"`
+			}
+		}
+	}
+	if json.Unmarshal(registered, &registrationEnvelope) != nil || !registrationEnvelope.OK || registrationEnvelope.Result.SchemaVersion != 6 || registrationEnvelope.Result.Metadata.Name != priority.PluginID || !registrationEnvelope.Result.Capabilities.Management {
+		t.Fatalf("invalid registration: %s", registered)
+	}
 	clock.Await(t)
 	if err := p.configure(lifecycle(validConfig)); err != nil {
 		t.Fatal(err)

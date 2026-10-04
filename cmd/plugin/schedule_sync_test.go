@@ -147,6 +147,17 @@ func TestCronRefreshesAuthAndQuotaAndPreservesRoundRules(t *testing.T) {
 	if state := p.getStatus(); state.Error != "plugin_not_enabled" {
 		t.Fatalf("disabled instance kept running: %+v", state)
 	}
+	s.mu.Lock()
+	s.disabled = false
+	s.files = []map[string]any{}
+	s.mu.Unlock()
+	if err := p.configure(lifecycle(validConfig)); err != nil {
+		t.Fatal(err)
+	}
+	clock.Await(t)
+	if state := p.getStatus(); state.Phase != "empty" {
+		t.Fatalf("host re-enable did not restart the schedule: %+v", state)
+	}
 }
 
 func TestCronManagementAuthenticationFailureStopsSchedule(t *testing.T) {
@@ -166,6 +177,12 @@ func TestCronManagementAuthenticationFailureStopsSchedule(t *testing.T) {
 			<-p.done
 			if state := p.getStatus(); state.Phase != "failed" || state.Error != "management_authentication_failed" {
 				t.Fatalf("authentication failure did not stop schedule: %+v", state)
+			}
+			if err := p.configure(lifecycle(validConfig)); err != nil {
+				t.Fatal(err)
+			}
+			if state := p.getStatus(); state.Error != "management_authentication_failed" {
+				t.Fatalf("identical key retried management authentication: %+v", state)
 			}
 		})
 	}
