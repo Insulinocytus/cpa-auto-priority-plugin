@@ -36,10 +36,14 @@ type managementStore struct {
 	probeError     string
 	selectedProxy  string
 	accountID      string
+	metadata       map[string]string
+	metadataCount  map[string]int
+	expectedURL    map[string]string
+	expectedUserID map[string]string
 }
 
 func store(files ...map[string]any) *managementStore {
-	return &managementStore{files: files, usage: map[string][]string{}, cards: map[string][]string{}, cardStatus: map[string]int{}, cardQueryCount: map[string]int{}, upstreamStatus: map[string]int{}, queryCount: map[string]int{}, writeCount: map[string]int{}, writeFailure: map[string]bool{}, key: "management-secret"}
+	return &managementStore{files: files, usage: map[string][]string{}, cards: map[string][]string{}, cardStatus: map[string]int{}, cardQueryCount: map[string]int{}, upstreamStatus: map[string]int{}, queryCount: map[string]int{}, writeCount: map[string]int{}, writeFailure: map[string]bool{}, metadata: map[string]string{}, metadataCount: map[string]int{}, expectedURL: map[string]string{}, expectedUserID: map[string]string{}, key: "management-secret"}
 }
 
 func credential(name, provider string) map[string]any {
@@ -69,6 +73,14 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 			}
 		}
 		return response, nil
+	case "GET /v8/management/credentials/download":
+		name := req.URL.Query().Get("name")
+		s.metadataCount[name]++
+		body, exists := s.metadata[name]
+		if !exists {
+			return jsonResponse(404, map[string]any{"error": "not found"}), nil
+		}
+		return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}, nil
 	case "POST /v8/management/requests/api-call":
 		var call struct {
 			AuthIndex string            `json:"auth_index"`
@@ -81,16 +93,46 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 			return nil, err
 		}
 		isCard := call.URL == "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
-		if call.Method != "GET" || (!isCard && call.URL != "https://chatgpt.com/backend-api/wham/usage") || call.Header["Authorization"] != "Bearer $TOKEN$" || call.ProxyURL != nil {
+		if call.Method != "GET" || call.Header["Authorization"] != "Bearer $TOKEN$" || call.ProxyURL != nil {
 			return jsonResponse(400, map[string]any{"error": "invalid query contract"}), nil
 		}
+		var selected map[string]any
 		for _, file := range s.files {
 			if file["auth_index"] == call.AuthIndex {
+				selected = file
 				s.selectedProxy, _ = file["proxy_url"].(string)
 				if token, ok := file["id_token"].(map[string]any); ok && call.Header["Chatgpt-Account-Id"] != token["chatgpt_account_id"] {
 					return jsonResponse(400, map[string]any{"error": "wrong selected account"}), nil
 				}
 			}
+		}
+		if selected == nil {
+			return jsonResponse(400, map[string]any{"error": "missing auth"}), nil
+		}
+		if expected := s.expectedURL[call.AuthIndex]; expected != "" && call.URL != expected {
+			return jsonResponse(400, map[string]any{"error": "account quota is only available on its own domain"}), nil
+		}
+		if call.Header["x-userid"] != s.expectedUserID[call.AuthIndex] {
+			return jsonResponse(400, map[string]any{"error": "wrong selected account identity"}), nil
+		}
+		switch selected["provider"] {
+		case "codex":
+			if !isCard && call.URL != "https://chatgpt.com/backend-api/wham/usage" {
+				return jsonResponse(400, map[string]any{"error": "wrong codex endpoint"}), nil
+			}
+		case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
+			if call.URL != "https://api.kimi.com/coding/v1/usages" && call.URL != "https://api.kimi.ai/coding/v1/usages" {
+				return jsonResponse(400, map[string]any{"error": "wrong kimi endpoint"}), nil
+			}
+			if len(call.Header) != 1 {
+				return jsonResponse(400, map[string]any{"error": "foreign kimi identity"}), nil
+			}
+		case "xai":
+			if call.URL != "https://cli-chat-proxy.grok.com/v1/billing?format=credits" || call.Header["x-xai-token-auth"] != "xai-grok-cli" || call.Header["Chatgpt-Account-Id"] != "" {
+				return jsonResponse(400, map[string]any{"error": "wrong xai quota contract"}), nil
+			}
+		default:
+			return jsonResponse(400, map[string]any{"error": "unsupported query"}), nil
 		}
 		s.accountID = call.Header["Chatgpt-Account-Id"]
 		if isCard {

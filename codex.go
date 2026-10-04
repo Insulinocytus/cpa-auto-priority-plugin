@@ -7,7 +7,6 @@ import (
 	"errors"
 	"math"
 	"math/big"
-	"sort"
 	"strconv"
 	"time"
 )
@@ -33,23 +32,14 @@ func (s *Synchronizer) codex(ctx context.Context, file authFile) ([]time.Time, s
 	if status != "ok" {
 		return nil, status
 	}
-	durations := make([]int64, 0, len(periods))
-	for duration := range periods {
-		durations = append(durations, duration)
-	}
-	sort.Slice(durations, func(i, j int) bool { return durations[i] > durations[j] })
-	sequence := make([]time.Time, 0, len(durations))
-	for _, duration := range durations {
-		sequence = append(sequence, periods[duration])
-	}
-	return sequence, "ok"
+	return periodSequence(periods), "ok"
 }
 
 func retryQuery(ctx context.Context, status string) bool {
 	return ctx.Err() == nil && status != "ok" && status != "no_reset_time" && status != "credentials_invalid" && status != ErrManagementAuthentication.Error()
 }
 
-func (s *Synchronizer) codexRequest(ctx context.Context, file authFile, path string) (string, string) {
+func (s *Synchronizer) codexRequest(ctx context.Context, file authFile, path string) ([]byte, string) {
 	headers := map[string]string{"Authorization": "Bearer $TOKEN$", "Content-Type": "application/json", "User-Agent": "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)"}
 	if path == "rate-limit-reset-credits" {
 		headers["Accept"] = "application/json"
@@ -59,26 +49,7 @@ func (s *Synchronizer) codexRequest(ctx context.Context, file authFile, path str
 	if file.IDToken.AccountID != "" {
 		headers["Chatgpt-Account-Id"] = file.IDToken.AccountID
 	}
-	call := struct {
-		AuthIndex string            `json:"auth_index"`
-		Method    string            `json:"method"`
-		URL       string            `json:"url"`
-		Header    map[string]string `json:"header"`
-	}{file.Index, "GET", "https://chatgpt.com/backend-api/wham/" + path, headers}
-	var response struct {
-		Status int    `json:"status_code"`
-		Body   string `json:"body"`
-	}
-	if err := s.request(ctx, "POST", "requests/api-call", call, &response); err != nil {
-		return "", err.Error()
-	}
-	if response.Status == 401 {
-		return "", "credentials_invalid"
-	}
-	if response.Status < 200 || response.Status >= 300 {
-		return "", "upstream_http_failed"
-	}
-	return response.Body, "ok"
+	return s.quotaGET(ctx, file, "https://chatgpt.com/backend-api/wham/"+path, headers)
 }
 
 func (s *Synchronizer) codexUsage(ctx context.Context, file authFile) (map[int64]time.Time, string) {
@@ -90,7 +61,7 @@ func (s *Synchronizer) codexUsage(ctx context.Context, file authFile) (map[int64
 	var usage struct {
 		RateLimit json.RawMessage `json:"rate_limit"`
 	}
-	payload := bytes.TrimSpace([]byte(body))
+	payload := bytes.TrimSpace(body)
 	if len(payload) == 0 || payload[0] != '{' || json.Unmarshal(payload, &usage) != nil {
 		return nil, "quota_response_malformed"
 	}
@@ -123,21 +94,17 @@ func (s *Synchronizer) codexUsage(ctx context.Context, file authFile) (map[int64
 		if durationErr != nil || durationValue <= 0 || durationValue != math.Trunc(durationValue) || durationValue >= float64(math.MaxInt64) {
 			return nil, "quota_response_malformed"
 		}
-		duration := int64(durationValue)
-		// Official UI classifies 28–31 day windows as the same monthly period.
-		if duration >= 28*86400 && duration <= 31*86400 {
-			duration = 31 * 86400
-		}
+		duration := quotaLayer(int64(durationValue))
 		var reset time.Time
 		var err error
 		if len(window.Reset) > 0 && !isNull(window.Reset) {
 			reset, err = instant(window.Reset)
 		} else if len(window.After) > 0 && !isNull(window.After) {
-			seconds, parseErr := number(window.After)
-			if parseErr != nil || seconds < 0 || seconds >= float64(math.MaxInt64)/float64(time.Second) {
+			after, ok := relativeSeconds(window.After)
+			if !ok {
 				return nil, "quota_response_malformed"
 			}
-			reset = observed.Add(time.Duration(seconds * float64(time.Second)))
+			reset = observed.Add(after)
 		} else {
 			continue
 		}
@@ -171,7 +138,7 @@ func (s *Synchronizer) codexCards(ctx context.Context, file authFile, periods ma
 			Expires json.RawMessage `json:"expires_at"`
 		} `json:"credits"`
 	}
-	if json.Unmarshal([]byte(body), &payload) != nil || payload.Available == nil || *payload.Available < 0 || payload.Credits == nil {
+	if json.Unmarshal(body, &payload) != nil || payload.Available == nil || *payload.Available < 0 || payload.Credits == nil {
 		return "reset_card_response_malformed"
 	}
 	observed := s.now()

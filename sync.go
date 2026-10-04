@@ -194,6 +194,10 @@ func (s *Synchronizer) Sync(ctx context.Context) (Round, error) {
 	}
 	files := make([]authFile, 0, len(*snapshot.Files))
 	ids := make(map[string]bool)
+	names := make(map[string]int, len(*snapshot.Files))
+	for _, file := range *snapshot.Files {
+		names[file.Name]++
+	}
 	for _, file := range *snapshot.Files {
 		if file.RuntimeOnly == nil || *file.RuntimeOnly || file.Source != "file" || file.Path == "" {
 			continue
@@ -220,18 +224,26 @@ func (s *Synchronizer) Sync(ctx context.Context) (Round, error) {
 	groups := make(map[string][]int)
 	for i, file := range files {
 		result := Result{Name: file.Name, Provider: file.Provider, Priority: -1, QueryStatus: "unsupported_provider", WriteStatus: "not_attempted", Persistence: "unverified"}
-		if file.Provider == "codex" {
-			result.QueryStatus = "missing_auth_index"
-			if file.Index != "" {
-				sequences[i], result.QueryStatus = s.codex(ctx, file)
-				if result.QueryStatus == ErrManagementAuthentication.Error() {
-					round.Results = append(round.Results, result)
-					return round, ErrManagementAuthentication
-				}
+		query, status := s.quotaQuery(ctx, file, names[file.Name] == 1)
+		result.QueryStatus = status
+		for attempt := 0; query != nil && attempt < 2; attempt++ {
+			sequences[i], result.QueryStatus = query()
+			// Codex retries usage and cards separately; never replay its whole query.
+			if file.Provider == "codex" || !retryQuery(ctx, result.QueryStatus) {
+				break
 			}
 		}
+		if result.QueryStatus == ErrManagementAuthentication.Error() {
+			round.Results = append(round.Results, result)
+			return round, ErrManagementAuthentication
+		}
 		if len(sequences[i]) > 0 {
-			groups[file.Provider] = append(groups[file.Provider], i)
+			// Pinned host executorKeyFromAuth schedules these aliases together.
+			group := map[string]string{"kimi.com": "kimi", "kimi.ai": "kimi-ai"}[file.Provider]
+			if group == "" {
+				group = file.Provider
+			}
+			groups[group] = append(groups[group], i)
 		}
 		round.Results = append(round.Results, result)
 	}
@@ -295,6 +307,40 @@ func compare(a, b []time.Time) int {
 		return 1
 	}
 	return 0
+}
+
+// quotaQuery resolves provider prerequisites once; only upstream queries are
+// retried. Codex owns its per-request retries. A nil query leaves auth unsortable.
+func (s *Synchronizer) quotaQuery(ctx context.Context, file authFile, uniqueName bool) (func() ([]time.Time, string), string) {
+	if file.Provider != "codex" && file.Provider != "xai" && !isKimi(file.Provider) {
+		return nil, "unsupported_provider"
+	}
+	if file.Index == "" {
+		return nil, "missing_auth_index"
+	}
+	if file.Provider == "codex" {
+		return func() ([]time.Time, string) { return s.codex(ctx, file) }, "ok"
+	}
+	// Metadata download is by filename; never guess between duplicate names.
+	if !uniqueName {
+		return nil, "auth_metadata_ambiguous"
+	}
+	metadata, status := s.quotaMetadata(ctx, file)
+	if status != "ok" {
+		return nil, status
+	}
+	if isKimi(file.Provider) {
+		endpoint, status := kimiURL(metadata, file)
+		if status != "ok" {
+			return nil, status
+		}
+		return func() ([]time.Time, string) { return s.kimi(ctx, file, endpoint) }, "ok"
+	}
+	headers, status := xaiHeaders(metadata)
+	if status != "ok" {
+		return nil, status
+	}
+	return func() ([]time.Time, string) { return s.xai(ctx, file, headers) }, "ok"
 }
 
 // Provider parsing establishes validity and scope; this shared synchronization
