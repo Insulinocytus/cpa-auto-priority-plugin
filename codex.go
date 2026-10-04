@@ -7,7 +7,6 @@ import (
 	"errors"
 	"math"
 	"math/big"
-	"sort"
 	"strconv"
 	"time"
 )
@@ -17,30 +16,15 @@ func (s *Synchronizer) codex(ctx context.Context, file authFile) ([]time.Time, s
 	if file.IDToken.AccountID != "" {
 		headers["Chatgpt-Account-Id"] = file.IDToken.AccountID
 	}
-	call := struct {
-		AuthIndex string            `json:"auth_index"`
-		Method    string            `json:"method"`
-		URL       string            `json:"url"`
-		Header    map[string]string `json:"header"`
-	}{file.Index, "GET", "https://chatgpt.com/backend-api/wham/usage", headers}
-	var response struct {
-		Status int    `json:"status_code"`
-		Body   string `json:"body"`
-	}
-	if err := s.request(ctx, "POST", "requests/api-call", call, &response); err != nil {
-		return nil, err.Error()
-	}
-	if response.Status == 401 {
-		return nil, "credentials_invalid"
-	}
-	if response.Status < 200 || response.Status >= 300 {
-		return nil, "upstream_http_failed"
+	body, status := s.quotaGET(ctx, file, "https://chatgpt.com/backend-api/wham/usage", headers)
+	if status != "ok" {
+		return nil, status
 	}
 	observed := s.now()
 	var usage struct {
 		RateLimit json.RawMessage `json:"rate_limit"`
 	}
-	payload := bytes.TrimSpace([]byte(response.Body))
+	payload := bytes.TrimSpace(body)
 	if len(payload) == 0 || payload[0] != '{' || json.Unmarshal(payload, &usage) != nil {
 		return nil, "quota_response_malformed"
 	}
@@ -73,21 +57,17 @@ func (s *Synchronizer) codex(ctx context.Context, file authFile) ([]time.Time, s
 		if durationErr != nil || durationValue <= 0 || durationValue != math.Trunc(durationValue) || durationValue >= float64(math.MaxInt64) {
 			return nil, "quota_response_malformed"
 		}
-		duration := int64(durationValue)
-		// Official UI classifies 28–31 day windows as the same monthly period.
-		if duration >= 28*86400 && duration <= 31*86400 {
-			duration = 31 * 86400
-		}
+		duration := quotaLayer(int64(durationValue))
 		var reset time.Time
 		var err error
 		if len(window.Reset) > 0 && !isNull(window.Reset) {
 			reset, err = instant(window.Reset)
 		} else if len(window.After) > 0 && !isNull(window.After) {
-			seconds, parseErr := number(window.After)
-			if parseErr != nil || seconds < 0 || seconds >= float64(math.MaxInt64)/float64(time.Second) {
+			after, ok := relativeSeconds(window.After)
+			if !ok {
 				return nil, "quota_response_malformed"
 			}
-			reset = observed.Add(time.Duration(seconds * float64(time.Second)))
+			reset = observed.Add(after)
 		} else {
 			continue
 		}
@@ -104,16 +84,7 @@ func (s *Synchronizer) codex(ctx context.Context, file authFile) ([]time.Time, s
 	if len(periods) == 0 {
 		return nil, "no_reset_time"
 	}
-	durations := make([]int64, 0, len(periods))
-	for duration := range periods {
-		durations = append(durations, duration)
-	}
-	sort.Slice(durations, func(i, j int) bool { return durations[i] > durations[j] })
-	sequence := make([]time.Time, 0, len(durations))
-	for _, duration := range durations {
-		sequence = append(sequence, periods[duration])
-	}
-	return sequence, "ok"
+	return periodSequence(periods), "ok"
 }
 
 func isNull(raw json.RawMessage) bool { return bytes.Equal(bytes.TrimSpace(raw), []byte("null")) }
