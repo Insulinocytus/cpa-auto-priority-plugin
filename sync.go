@@ -223,15 +223,10 @@ func (s *Synchronizer) Sync(ctx context.Context) (Round, error) {
 		if file.Provider == "codex" {
 			result.QueryStatus = "missing_auth_index"
 			if file.Index != "" {
-				for range 2 {
-					sequences[i], result.QueryStatus = s.codex(ctx, file)
-					if result.QueryStatus == ErrManagementAuthentication.Error() {
-						round.Results = append(round.Results, result)
-						return round, ErrManagementAuthentication
-					}
-					if result.QueryStatus == "ok" || result.QueryStatus == "no_reset_time" || result.QueryStatus == "credentials_invalid" || ctx.Err() != nil {
-						break
-					}
+				sequences[i], result.QueryStatus = s.codex(ctx, file)
+				if result.QueryStatus == ErrManagementAuthentication.Error() {
+					round.Results = append(round.Results, result)
+					return round, ErrManagementAuthentication
 				}
 			}
 		}
@@ -300,4 +295,12 @@ func compare(a, b []time.Time) int {
 		return 1
 	}
 	return 0
+}
+
+// Provider parsing establishes validity and scope; this shared synchronization
+// rule only lowers an existing period's sorting time, never creates a window.
+func applyCardExpiry(periods map[int64]time.Time, duration int64, expiry time.Time) {
+	if reset, exists := periods[duration]; exists && !expiry.IsZero() && expiry.Before(reset) {
+		periods[duration] = expiry
+	}
 }
