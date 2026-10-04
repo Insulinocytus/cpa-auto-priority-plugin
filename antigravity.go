@@ -30,7 +30,7 @@ func (s *Synchronizer) antigravity(ctx context.Context, file authFile, attempt i
 		Project string `json:"project"`
 	}{project})
 	headers := map[string]string{"Authorization": "Bearer $TOKEN$", "Content-Type": "application/json", "User-Agent": "antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)"}
-	payload, status := s.upstream(ctx, apiCall{AuthIndex: file.Index, Method: "POST", URL: antigravityQuotaURLs[attempt], Header: headers, Data: string(body)})
+	payload, status := s.upstream(ctx, file.Index, "POST", antigravityQuotaURLs[attempt], headers, string(body))
 	if status != "ok" {
 		return nil, status
 	}
@@ -94,5 +94,5 @@ func (s *Synchronizer) antigravity(ctx context.Context, file authFile, attempt i
 	if len(periods) == 0 {
 		return nil, "no_reset_time"
 	}
-	return periodSequence(periods), "ok"
+	return ordered(periods)
 }

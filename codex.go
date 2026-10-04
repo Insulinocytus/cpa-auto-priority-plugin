@@ -1,13 +1,9 @@
 package priority
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"math"
-	"math/big"
-	"strconv"
 	"time"
 )
 
@@ -32,7 +28,7 @@ func (s *Synchronizer) codex(ctx context.Context, file authFile) ([]time.Time, s
 	if status != "ok" {
 		return nil, status
 	}
-	return periodSequence(periods), "ok"
+	return ordered(periods)
 }
 
 func retryQuery(ctx context.Context, status string) bool {
@@ -49,11 +45,11 @@ func (s *Synchronizer) codexRequest(ctx context.Context, file authFile, path str
 	if file.IDToken.AccountID != "" {
 		headers["Chatgpt-Account-Id"] = file.IDToken.AccountID
 	}
-	return s.quotaGET(ctx, file, "https://chatgpt.com/backend-api/wham/"+path, headers)
+	return s.upstream(ctx, file.Index, "GET", "https://chatgpt.com/backend-api/wham/"+path, headers, "")
 }
 
 func (s *Synchronizer) codexUsage(ctx context.Context, file authFile) (map[int64]time.Time, string) {
-	body, status := s.codexRequest(ctx, file, "usage")
+	payload, status := s.codexRequest(ctx, file, "usage")
 	if status != "ok" {
 		return nil, status
 	}
@@ -61,7 +57,6 @@ func (s *Synchronizer) codexUsage(ctx context.Context, file authFile) (map[int64
 	var usage struct {
 		RateLimit json.RawMessage `json:"rate_limit"`
 	}
-	payload := bytes.TrimSpace(body)
 	if len(payload) == 0 || payload[0] != '{' || json.Unmarshal(payload, &usage) != nil {
 		return nil, "quota_response_malformed"
 	}
@@ -185,22 +180,6 @@ func (s *Synchronizer) codexCards(ctx context.Context, file authFile, periods ma
 	return "ok"
 }
 
-func isNull(raw json.RawMessage) bool { return bytes.Equal(bytes.TrimSpace(raw), []byte("null")) }
-
-func number(raw json.RawMessage) (float64, error) {
-	text := string(raw)
-	if len(text) > 0 && text[0] == '"' {
-		if json.Unmarshal(raw, &text) != nil {
-			return 0, errors.New("invalid_time")
-		}
-	}
-	value, err := strconv.ParseFloat(text, 64)
-	if err != nil || math.IsNaN(value) || math.IsInf(value, 0) {
-		return 0, errors.New("invalid_time")
-	}
-	return value, nil
-}
-
 func instant(raw json.RawMessage) (time.Time, error) {
 	var text string
 	if json.Unmarshal(raw, &text) == nil {
@@ -210,36 +189,5 @@ func instant(raw json.RawMessage) (time.Time, error) {
 	} else {
 		text = string(raw)
 	}
-	value, err := strconv.ParseFloat(text, 64)
-	if err != nil || value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
-		return time.Time{}, errors.New("invalid_time")
-	}
-	unit := int64(time.Second)
-	if value >= 1e11 {
-		unit = int64(time.Millisecond)
-	}
-	if value*float64(unit)/float64(time.Second) > 253402300799 {
-		return time.Time{}, errors.New("invalid_time")
-	}
-	// The usual integral Unix value needs no arbitrary-precision allocation.
-	if integer, err := strconv.ParseInt(text, 10, 64); err == nil {
-		if unit == int64(time.Millisecond) {
-			return time.UnixMilli(integer).UTC(), nil
-		}
-		return time.Unix(integer, 0).UTC(), nil
-	}
-	// Decimal/exponent values must retain the original digits: float64 epoch
-	// seconds cannot represent nanosecond precision, even with FormatFloat.
-	exact, ok := new(big.Rat).SetString(text)
-	if !ok {
-		return time.Time{}, errors.New("invalid_time")
-	}
-	if unit == int64(time.Millisecond) {
-		exact.Quo(exact, big.NewRat(1000, 1))
-	}
-	var seconds, nanos big.Int
-	seconds.QuoRem(exact.Num(), exact.Denom(), &nanos)
-	nanos.Mul(&nanos, big.NewInt(int64(time.Second)))
-	nanos.Quo(&nanos, exact.Denom())
-	return time.Unix(seconds.Int64(), nanos.Int64()).UTC(), nil
+	return unix(text, true)
 }

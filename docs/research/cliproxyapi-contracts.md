@@ -86,6 +86,16 @@
 
 将所有比较时间转成绝对时刻；不能比较显示字符串。相对重置秒数必须以本次观测时刻为基准，不能沿用昨天的倒计时。官方界面兼容 ISO 与 Unix 秒/毫秒。[时间解析](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/ee79a794526a30c03748a8864a9ac6589a31833b/src/utils/quota/resetInstants.ts)。
 
+### Devin 与 Meta 额度契约
+
+以下为 issue #7 实现所依据的固定版本源码，仍未用真实账号验证。
+
+- **Devin 请求**：`POST https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus`，header `Content-Type: application/json`、`Connect-Protocol-Version: 1`；正文为 `metadata`（`ideName/clientName=chisel`、`ideVersion/extensionVersion=3000.10.21`、`locale=en`、`os=darwin`）且 `apiKey` 为 `$TOKEN$`。宿主 `APICall` 对 `data` 中的 `$TOKEN$` 同样替换为所选认证的 token，并在 JSON 正文中转义。[请求](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/ee79a794526a30c03748a8864a9ac6589a31833b/src/features/quota/providers/devin/requests.ts)、[正文替换](https://github.com/router-for-me/CLIProxyAPI/blob/8ef43e4df3b216a42493105d31c2873b69191473/internal/api/handlers/management/api_tools.go#L32-L238)。
+- **Devin 字段**：`userStatus.planStatus.dailyQuotaResetAtUnix`（24 小时）与 `weeklyQuotaResetAtUnix`（168 小时），Unix 秒，数字或数字字符串（Connect JSON 的 int64），非正值视为未知。`planStart/planEnd` 单独解析为套餐期限，不是额度重置。官方界面在没有任何窗口观测时报 `empty_data`。[解析](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/ee79a794526a30c03748a8864a9ac6589a31833b/src/services/api/devinQuota.ts)。
+- **Meta 认证**：官方界面通过管理下载接口读取认证文件，只取顶层 `dca_token`，要求匹配 `^dca:\S+$`，并注明不回退 LLM key；请求为 `POST https://api.meta.ai/muse-code/key`，header `Accept/Content-Type: application/json`、`Authorization: Bearer <dca>`、`x-api-version: 1.0.0`，正文 `{}`。宿主对 Meta 的 `$TOKEN$` 走 `resolveMetaToken`（LLM 凭据或 mint），不是 DCA。v8 下载路由为 `GET /v8/management/credentials/download?name=<file>.json`，按文件名读取 auth 目录中的文件并原样返回。[请求与 DCA](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/ee79a794526a30c03748a8864a9ac6589a31833b/src/features/quota/providers/meta/requests.ts)、[宿主 Meta token](https://github.com/router-for-me/CLIProxyAPI/blob/8ef43e4df3b216a42493105d31c2873b69191473/internal/api/handlers/management/api_tools.go#L674-L700)、[v8 路由](https://github.com/router-for-me/CLIProxyAPI/blob/8ef43e4df3b216a42493105d31c2873b69191473/internal/api/server_management_v8.go)、[下载](https://github.com/router-for-me/CLIProxyAPI/blob/8ef43e4df3b216a42493105d31c2873b69191473/internal/api/handlers/management/auth_files_crud.go#L26-L47)。
+- **Meta 字段**：`subs_usage.window`（`used_percent`、`window_duration_mins`、`resets_at`）与 `subs_usage.weekly`（`used_percent`、`resets_at`）；`resets_at` 为 Unix 秒（界面乘以 1000 显示）。有效对象但没有 `subs_usage` 是成功观测、额度未知（例如账号首次请求前），不是零也不是请求错误；无效正文与之区分。响应可能包含 `api_key` 与 PII，界面禁止保留源对象，也不从错误正文派生消息。[解析](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/ee79a794526a30c03748a8864a9ac6589a31833b/src/services/api/metaQuota.ts)、[单位](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/ee79a794526a30c03748a8864a9ac6589a31833b/src/features/quota/providers/meta/MetaQuotaBody.tsx#L45)。
+- **插件取舍**：重置值缺失、null 或非正时与官方解析一致，视为该层未知；官方解析把非数字文本也当未知，插件则判为 malformed（重试一次后该认证为 -1），不把损坏数据当作正常缺层。`window` 的周期只来自 `window_duration_mins`，有重置时间却没有有效周期时按 malformed 处理，不猜测周期；与周同周期且时刻不同按歧义处理。两者均未发现重置卡契约。
+
 ## 用户已确认的规则
 
 - 按 provider 分组，不按套餐拆分；排序依据全部相同则给相同 priority。

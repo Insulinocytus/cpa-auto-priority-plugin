@@ -128,33 +128,6 @@ func (s *Synchronizer) request(ctx context.Context, method, path string, body an
 // A failed required quota query is retried once: two requests at most.
 const queryAttempts = 2
 
-type apiCall struct {
-	AuthIndex string            `json:"auth_index"`
-	Method    string            `json:"method"`
-	URL       string            `json:"url"`
-	Header    map[string]string `json:"header"`
-	Data      string            `json:"data,omitempty"`
-}
-
-// upstream runs one quota request through the host, which substitutes
-// $TOKEN$ and keeps the selected auth's proxy. Providers validate the body.
-func (s *Synchronizer) upstream(ctx context.Context, call apiCall) ([]byte, string) {
-	var response struct {
-		Status int    `json:"status_code"`
-		Body   string `json:"body"`
-	}
-	if err := s.request(ctx, "POST", "requests/api-call", call, &response); err != nil {
-		return nil, err.Error()
-	}
-	if response.Status == 401 {
-		return nil, "credentials_invalid"
-	}
-	if response.Status < 200 || response.Status >= 300 {
-		return nil, "upstream_http_failed"
-	}
-	return []byte(response.Body), "ok"
-}
-
 // quotaPeriods holds one natural reset time per quota period, in seconds.
 type quotaPeriods map[int64]time.Time
 
@@ -270,15 +243,7 @@ func (s *Synchronizer) Sync(ctx context.Context) (Round, error) {
 	groups := make(map[string][]int)
 	for i, file := range files {
 		result := Result{Name: file.Name, Provider: file.Provider, Priority: -1, QueryStatus: "unsupported_provider", WriteStatus: "not_attempted", Persistence: "unverified"}
-		query, status := s.quotaQuery(ctx, file, names[file.Name] == 1)
-		result.QueryStatus = status
-		for attempt := 0; query != nil && attempt < queryAttempts; attempt++ {
-			sequences[i], result.QueryStatus = query()
-			// Codex retries usage and cards separately; never replay its whole query.
-			if file.Provider == "codex" || !retryQuery(ctx, result.QueryStatus) {
-				break
-			}
-		}
+		sequences[i], result.QueryStatus = s.quota(ctx, file, names[file.Name] == 1)
 		if result.QueryStatus == ErrManagementAuthentication.Error() {
 			round.Results = append(round.Results, result)
 			return round, ErrManagementAuthentication
@@ -353,51 +318,6 @@ func compare(a, b []time.Time) int {
 		return 1
 	}
 	return 0
-}
-
-// quotaQuery resolves provider prerequisites once; only upstream queries are
-// retried. Codex owns its per-request retries. A nil query leaves auth unsortable.
-func (s *Synchronizer) quotaQuery(ctx context.Context, file authFile, uniqueName bool) (func() ([]time.Time, string), string) {
-	if file.Provider != "codex" && file.Provider != "antigravity" && file.Provider != "xai" && !isKimi(file.Provider) {
-		return nil, "unsupported_provider"
-	}
-	if file.Index == "" {
-		return nil, "missing_auth_index"
-	}
-	if file.Provider == "codex" {
-		return func() ([]time.Time, string) { return s.codex(ctx, file) }, "ok"
-	}
-	if file.Provider == "antigravity" {
-		if strings.TrimSpace(file.ProjectID) == "" {
-			return nil, "missing_project_id"
-		}
-		attempt := 0
-		return func() ([]time.Time, string) {
-			sequence, status := s.antigravity(ctx, file, attempt)
-			attempt++
-			return sequence, status
-		}, "ok"
-	}
-	// Metadata download is by filename; never guess between duplicate names.
-	if !uniqueName {
-		return nil, "auth_metadata_ambiguous"
-	}
-	metadata, status := s.quotaMetadata(ctx, file)
-	if status != "ok" {
-		return nil, status
-	}
-	if isKimi(file.Provider) {
-		endpoint, status := kimiURL(metadata, file)
-		if status != "ok" {
-			return nil, status
-		}
-		return func() ([]time.Time, string) { return s.kimi(ctx, file, endpoint) }, "ok"
-	}
-	headers, status := xaiHeaders(metadata)
-	if status != "ok" {
-		return nil, status
-	}
-	return func() ([]time.Time, string) { return s.xai(ctx, file, headers) }, "ok"
 }
 
 // Provider parsing establishes validity and scope; this shared synchronization
