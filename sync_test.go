@@ -477,3 +477,26 @@ func TestConfigRejectsUnsafeManagementOriginsAndMissingAuthentication(t *testing
 		}
 	}
 }
+
+func TestSyncEquivalentFractionalInstantsShareRank(t *testing.T) {
+	for _, tc := range []struct{ name, iso, milliseconds, seconds, scientific string }{
+		{"millisecond", `"2027-01-01T00:00:00.123Z"`, "1798761600123", `"1798761600.123"`, "1798761600123e-3"},
+		{"nanosecond", `"2027-01-01T00:00:00.123456789Z"`, "1798761600123.456789", `"1798761600.123456789"`, "1798761600.123456789e0"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := store(credential("iso", "codex"), credential("milliseconds", "codex"), credential("seconds", "codex"), credential("scientific", "codex"))
+			for name, reset := range map[string]string{"iso": tc.iso, "milliseconds": tc.milliseconds, "seconds": tc.seconds, "scientific": tc.scientific} {
+				s.usage[name] = []string{fmt.Sprintf(`{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"reset_at":%s}}}`, reset)}
+			}
+			_, err := synchronizer(t, s).Sync(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, file := range s.files {
+				if file["priority"] != 0 {
+					t.Fatalf("equivalent instant split into ranks: %v", s.files)
+				}
+			}
+		})
+	}
+}

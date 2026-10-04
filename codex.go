@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"math"
+	"math/big"
 	"sort"
 	"strconv"
 	"time"
@@ -137,18 +138,39 @@ func instant(raw json.RawMessage) (time.Time, error) {
 		if parsed, err := time.Parse(time.RFC3339Nano, text); err == nil {
 			return parsed, nil
 		}
+	} else {
+		text = string(raw)
 	}
-	value, err := number(raw)
-	if err != nil || value <= 0 {
+	value, err := strconv.ParseFloat(text, 64)
+	if err != nil || value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
 		return time.Time{}, errors.New("invalid_time")
 	}
+	unit := int64(time.Second)
 	if value >= 1e11 {
-		value /= 1000
+		unit = int64(time.Millisecond)
 	}
-	// Reject values outside RFC3339's positive Unix range before conversion.
-	if value > 253402300799 {
+	if value*float64(unit)/float64(time.Second) > 253402300799 {
 		return time.Time{}, errors.New("invalid_time")
 	}
-	seconds, fraction := math.Modf(value)
-	return time.Unix(int64(seconds), int64(math.Round(fraction*1e9))).UTC(), nil
+	// The usual integral Unix value needs no arbitrary-precision allocation.
+	if integer, err := strconv.ParseInt(text, 10, 64); err == nil {
+		if unit == int64(time.Millisecond) {
+			return time.UnixMilli(integer).UTC(), nil
+		}
+		return time.Unix(integer, 0).UTC(), nil
+	}
+	// Decimal/exponent values must retain the original digits: float64 epoch
+	// seconds cannot represent nanosecond precision, even with FormatFloat.
+	exact, ok := new(big.Rat).SetString(text)
+	if !ok {
+		return time.Time{}, errors.New("invalid_time")
+	}
+	if unit == int64(time.Millisecond) {
+		exact.Quo(exact, big.NewRat(1000, 1))
+	}
+	var seconds, nanos big.Int
+	seconds.QuoRem(exact.Num(), exact.Denom(), &nanos)
+	nanos.Mul(&nanos, big.NewInt(int64(time.Second)))
+	nanos.Quo(&nanos, exact.Denom())
+	return time.Unix(seconds.Int64(), nanos.Int64()).UTC(), nil
 }
