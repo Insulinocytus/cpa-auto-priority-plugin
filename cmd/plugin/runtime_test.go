@@ -53,6 +53,16 @@ func TestStartupReconfigureOnceAndAuthenticatedStatus(t *testing.T) {
 		case "GET /v8/management/credentials":
 			return response(200, `{"observed_at":"2026-10-04T00:00:00Z","files":[{"id":"stable-id","name":"one.json","auth_index":"index","provider":"codex","source":"file","runtime_only":false,"path":"/auth/one.json"}]}`), nil
 		case "POST /v8/management/requests/api-call":
+			var call struct {
+				URL string `json:"url"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&call); err != nil {
+				t.Error(err)
+				return response(500, `{}`), nil
+			}
+			if call.URL == "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits" {
+				return response(200, `{"status_code":200,"body":"{\"available_count\":0,\"credits\":[]}"}`), nil
+			}
 			return response(200, `{"status_code":200,"body":"{\"rate_limit\":{\"primary_window\":{\"limit_window_seconds\":604800,\"reset_at\":1798761600}}}"}`), nil
 		case "PATCH /v8/management/credentials/fields":
 			var patch map[string]any
@@ -167,6 +177,16 @@ func TestStartupManagementAuthenticationFailureStopsAndReconfigureRecovers(t *te
 				case "PATCH /v8/management/credentials/fields":
 					return response(400, `{"error":"no fields to update"}`), nil
 				case "POST /v8/management/requests/api-call":
+					var call struct {
+						URL string `json:"url"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&call); err != nil {
+						t.Error(err)
+						return response(500, `{}`), nil
+					}
+					if call.URL == "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits" {
+						return response(200, `{"status_code":200,"body":"{\"available_count\":0,\"credits\":[]}"}`), nil
+					}
 					return response(200, `{"status_code":200,"body":"{\"rate_limit\":{\"primary_window\":{\"limit_window_seconds\":604800,\"reset_at\":1798761600}}}"}`), nil
 				default:
 					t.Errorf("unexpected operation after authentication failure: %s %s", r.Method, r.URL.Path)

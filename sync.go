@@ -228,7 +228,8 @@ func (s *Synchronizer) Sync(ctx context.Context) (Round, error) {
 		result.QueryStatus = status
 		for attempt := 0; query != nil && attempt < 2; attempt++ {
 			sequences[i], result.QueryStatus = query()
-			if result.QueryStatus == "ok" || result.QueryStatus == "no_reset_time" || result.QueryStatus == "credentials_invalid" || result.QueryStatus == ErrManagementAuthentication.Error() || ctx.Err() != nil {
+			// Codex retries usage and cards separately; never replay its whole query.
+			if file.Provider == "codex" || !retryQuery(ctx, result.QueryStatus) {
 				break
 			}
 		}
@@ -308,8 +309,8 @@ func compare(a, b []time.Time) int {
 	return 0
 }
 
-// quotaQuery resolves provider prerequisites once; only the returned upstream
-// query is retried. A nil query leaves the auth unsortable with the status.
+// quotaQuery resolves provider prerequisites once; only upstream queries are
+// retried. Codex owns its per-request retries. A nil query leaves auth unsortable.
 func (s *Synchronizer) quotaQuery(ctx context.Context, file authFile, uniqueName bool) (func() ([]time.Time, string), string) {
 	if file.Provider != "codex" && file.Provider != "xai" && !isKimi(file.Provider) {
 		return nil, "unsupported_provider"
@@ -340,4 +341,12 @@ func (s *Synchronizer) quotaQuery(ctx context.Context, file authFile, uniqueName
 		return nil, status
 	}
 	return func() ([]time.Time, string) { return s.xai(ctx, file, headers) }, "ok"
+}
+
+// Provider parsing establishes validity and scope; this shared synchronization
+// rule only lowers an existing period's sorting time, never creates a window.
+func applyCardExpiry(periods map[int64]time.Time, duration int64, expiry time.Time) {
+	if reset, exists := periods[duration]; exists && !expiry.IsZero() && expiry.Before(reset) {
+		periods[duration] = expiry
+	}
 }

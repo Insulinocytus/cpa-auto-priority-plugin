@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// periodSequence orders natural resets from the longest quota period down.
+// periodSequence orders sorting times from the longest quota period down.
 func periodSequence(periods map[int64]time.Time) []time.Time {
 	durations := make([]int64, 0, len(periods))
 	for duration := range periods {

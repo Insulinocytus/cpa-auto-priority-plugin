@@ -1,6 +1,6 @@
 # CPA Auto Priority
 
-CLIProxyAPI 原生 Go 插件：宿主管理接口就绪后立即执行一轮 Codex、Kimi、xAI **自然额度重置** priority 同步。对应 [issue #2](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/2) 与 [issue #5](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/5)。不实现后续工单的 cron、重置卡或其他 provider 查询。
+CLIProxyAPI 原生 Go 插件：宿主管理接口就绪后立即执行一轮 Codex、Kimi、xAI **自然额度重置** priority 同步，并让 Codex **有效重置卡**参与排序。对应 [issue #2](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/2)、[issue #3](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/3) 与 [issue #5](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/5)。不实现后续工单的 cron 或其他 provider 查询。
 
 ## 构建与配置
 
@@ -51,9 +51,12 @@ Authorization: Bearer <management key>
 5. 按明确的正整数 `limit_window_seconds` 从长到短组织时间序列；604800 秒是周，18000 秒是五小时。沿用官方管理界面分类，28–31 日统一为月层；其他明确周期按其秒数排序，不猜成周。ISO/RFC3339、Unix 秒/毫秒（官方 helper 的 `1e11` 分界）、numeric string 和相对秒数归一化为绝对时刻。相对值锚定该响应接收时刻，每轮重新观测。
    Unix 数值保留原单位的整数/十进制精度，等价的 ISO 与非整秒 Unix 编码不会因浮点转换被拆成不同档位。
 6. 相同周期、相同重置时刻合为一层；同周期不同重置时刻在上游没有查证的代表窗口契约，返回 `quota_period_ambiguous`，重试一次仍不明确则该认证为 -1。**不擅自取 min/max 或按槽位选代表窗口**。
-7. 同 provider 内比较各自最长周期的时间；越早越优先，相同才比较下一层，有下一层优先于没有下一层。时间序列完全相同共用档位。正常档位从最低 0 连续向上编号，不按套餐、文件名、输入顺序或额度量拆组。
-8. 必要额度请求失败或 malformed 仅重试失败请求一次；仍失败、401 明确失效、无任何可用自然重置、缺查询索引、未知 provider 均只将该物理认证设为 -1，其余继续。成功确认缺少/null 的短窗口不是失败；已有窗口的损坏周期/时间是失败。有效窗口的时间明确为 null/缺失时不虚构时间。不会拿订阅或 token 过期代替重置时间。
-9. 写前再次确认启用状态，仅 `PATCH /v8/management/credentials/fields {"name":"<id>","priority":N}`。不提交完整 auth JSON，不改变 disabled、token、代理或其他业务字段。写入失败返回 `write_status=failed`，不重试、不回滚，继续尝试其他认证；HTTP 2xx 且 `status=ok` 仅为 `acknowledged`，**从不声称磁盘持久化已验证**。
+7. 成功取得自然额度后，用同一 `auth_index`、账号 header 和代理语义代发 `GET https://chatgpt.com/backend-api/wham/rate-limit-reset-credits`，额外沿用管理界面的 `Accept: application/json`、`OpenAI-Beta: codex-1`、`Originator: Codex Desktop`。只读取卡详情，不使用 `/consume`、购买、领取或主动重置 mutation；账户 `credits.balance` 与重置卡无关。
+8. 当前已查证的重置卡类型是 `reset_type=codex_rate_limits`、`status=available` 的一次性权益：要求合法 `granted_at` 且不晚于本次卡响应观测时间；有到期时间时必须晚于观测时间和授予时间。`redeeming`、`redeemed`、其他非 available 状态、未来授予及已到期卡均不参与；`expires_at` 缺失/null 按第一方可选字段契约表示不过期，没有可提前排序的到期时刻。多张有效卡取最早到期，与该卡适用的自然时间取 min；相等不加档位，卡不创建缺失窗口。
+   当前已查证的重置卡类型（`codex_rate_limits`）仅作用于通用周（604800 秒）和五小时（18000 秒）层；**未查证月卡、其他周期或模型专属卡契约，不声称这些接口已支持或不存在**。月层保留自然时间，周卡不能覆盖月时间。`applicable_available_count` 不是持有卡数量，其计算公式未查证；不以它为零或账号未触及 limit 排除有效卡，也不按使用率、剩余额度量或耗尽状态排序。
+9. 同 provider 内比较各自最长周期的排序时间；越早越优先，相同才比较下一层，有下一层优先于没有下一层。时间序列完全相同共用档位。正常档位从最低 0 连续向上编号，不按套餐、文件名、输入顺序或额度量拆组。
+10. 必要额度或卡请求失败/malformed 仅重试失败请求一次；成功额度不因卡失败重复请求。仍失败、401 明确失效、无任何可用自然重置、缺查询索引、未知 provider 均只将该物理认证设为 -1，其余继续。卡详情必须有非负整数 `available_count` 和实际 `credits` 数组；成功零卡与失败严格区分。后端可截断详情：available 行数不足汇总时为 `reset_card_details_incomplete`；数量矛盾或必要字段损坏为 `reset_card_response_malformed`；available 卡类型未知为 `reset_card_applicability_unknown`，都不假造“无卡”。成功确认缺少/null 的短窗口不是失败；已有窗口的损坏周期/时间是失败。有效窗口的时间明确为 null/缺失时不虚构时间。不会拿订阅或 token 过期代替重置时间。
+11. 写前再次确认启用状态，仅 `PATCH /v8/management/credentials/fields {"name":"<id>","priority":N}`。不提交完整 auth JSON，不改变 disabled、token、代理或其他业务字段。写入失败返回 `write_status=failed`，不重试、不回滚，继续尝试其他认证；HTTP 2xx 且 `status=ok` 仅为 `acknowledged`，**从不声称磁盘持久化已验证**。
 
 ### Kimi 与 xAI
 
@@ -89,6 +92,8 @@ Codex 基准：[官方管理界面 `ee79a79`](https://github.com/router-for-me/C
 
 - [周期、scope、请求 headers](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/ee79a794526a30c03748a8864a9ac6589a31833b/src/features/quota/providers/codex/data.ts#L68-L445)、[ISO/Unix/相对时间 helper](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/ee79a794526a30c03748a8864a9ac6589a31833b/src/utils/quota/resetInstants.ts#L23-L77)。
 - [上游脱敏格式 fixture](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/ee79a794526a30c03748a8864a9ac6589a31833b/tests/codexQuota.test.ts#L28-L63) 含通用周窗口及独立 Spark 周窗口。UT 保留其自然额度形状，其他月/ISO/边界数据注明为合成输入；不声称采集过真实账号响应。
+- 重置卡第一方基准：[OpenAI Codex `afb436d`](https://github.com/openai/codex/tree/afb436df8b70bb5bc57b86d9a3e829968988cd21)。[GET 与路径](https://github.com/openai/codex/blob/afb436df8b70bb5bc57b86d9a3e829968988cd21/codex-rs/backend-client/src/client/rate_limit_resets.rs)、[原始详情字段](https://github.com/openai/codex/blob/afb436df8b70bb5bc57b86d9a3e829968988cd21/codex-rs/backend-client/src/types.rs)、[`codex_rate_limits` 周+五小时 fixture](https://github.com/openai/codex/blob/afb436df8b70bb5bc57b86d9a3e829968988cd21/codex-rs/backend-client/src/client/rate_limit_resets_tests.rs)、[详情可能截断](https://github.com/openai/codex/blob/afb436df8b70bb5bc57b86d9a3e829968988cd21/codex-rs/app-server-protocol/schema/typescript/v2/RateLimitResetCreditsSummary.ts)、[官方 banked reset 语义](https://help.openai.com/en/articles/20001498-how-banked-codex-resets-work)。这证明当前已查证的重置卡类型路径，不是对所有未来 offer 的适用性承诺；新类型需要重新查证。
+- `applicable_available_count=0` 但仍持有卡的[管理界面 fixture](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/ee79a794526a30c03748a8864a9ac6589a31833b/tests/codexQuota.test.ts#L28-L116) 与 [GET headers](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/ee79a794526a30c03748a8864a9ac6589a31833b/src/features/quota/providers/codex/data.ts#L366-L410)。更完整的证据和未知项见 [接口调查](docs/research/cliproxyapi-contracts.md#codex-重置权益第一方语义与接口边界)。
 
 **限制：** 没有跨文件事务，也没有跨探测/查询/写入的快照事务。宿主 disable 不通知仍加载的库，本插件依赖 `effective_enabled` 检查；检查后立刻 disable 或 auth 集合变化仍有 TOCTOU，窄 PATCH 的 virtual guard 继续保护虚拟认证。不同 provider 的编号独立计算，宿主混合 provider 路由仍可能跨 provider 比较最终数字；插件不改变路由规则。停止插件不会恢复此前已写入的 priority。
 
@@ -101,8 +106,10 @@ go vet ./...                                # 类型/静态检查
 go test -race ./...                         # 最终完整 UT，含并发检查
 ```
 
-UT 使用固定时钟和有状态 HTTP transport adapter：不监听端口、不访问真实网络/账号、不加载真实宿主。覆盖多周期 precedence、跨套餐/缺层/同档、输入顺序、provider 隔离、ISO/秒/毫秒/相对时间及跨年、重试隔离、virtual/配置项排除、仅 priority 变化、并发 token 刷新保留、写入失败、显式鉴权/代理语义、敏感数据不泄露、配置注册/reconfigure/取消退出；管理读取、物理认证探测、额度代发及 priority 写入的 401/403 立即终止，修正密钥后可重新配置恢复。Kimi 覆盖月-only、月+短周期、跨套餐、相对时间重新观测、域名与 Moonshot/外部凭据拒绝；xAI 覆盖真实周额度与月账单/余额/API key 区分；并与 Codex 混合执行受控更新及失败隔离。Kimi/xAI 响应均为按上游源码字段构造的合成数据，不是账号采样。
+UT 使用固定时钟和有状态 HTTP transport adapter：不监听端口、不访问真实网络/账号、不加载真实宿主。覆盖多周期 precedence、跨套餐/缺层/同档、输入顺序、provider 隔离、ISO/秒/毫秒/相对时间及跨年、重试隔离、virtual/配置项排除、仅 priority 变化、并发 token 刷新保留、写入失败、显式鉴权/代理语义、敏感数据不泄露、配置注册/reconfigure/取消退出；管理读取、物理认证探测、额度/卡代发及 priority 写入的 401/403 立即终止，修正密钥后可重新配置恢复。重置卡 UT 覆盖早/等/晚、多卡、未生效/过期/已消费/消费中/不失效、未知适用性、缺字段和截断详情、月层与五小时 precedence、尚未触及 limit、下一轮卡消费后重新排序；从完整 `Sync` 入口观察最终 priority 与存储业务状态。Kimi 覆盖月-only、月+短周期、跨套餐、相对时间重新观测、域名与 Moonshot/外部凭据拒绝；xAI 覆盖真实周额度与月账单/余额/API key 区分；并与 Codex 混合执行受控更新及失败隔离。Kimi/xAI 响应均为按上游源码字段构造的合成数据，不是账号采样。
 
-实现阶段另外完成 Windows `c-shared` 编译（未加载）和无网络、受控 transport 的单轮入口运行检查；临时程序与构建产物已移除。这些检查同样不证明真实宿主或磁盘兼容性。
+issue #2 实现阶段另外完成 Windows `c-shared` 编译（未加载）和无网络、受控 transport 的单轮入口运行检查；临时程序与构建产物已移除。这些历史检查不证明真实宿主或磁盘兼容性。issue #3 重置卡改动只做确定性 UT，不安排 smoke、真实加载或真实账号请求。
+
+PR #12 合并验证另用临时程序经过 loopback HTTP 服务运行混合 Codex/Kimi/xAI `Sync`：确认 Codex 卡到期参与排序、卡查询失败仅重试一次且不重查成功额度、失败仅影响该认证、其他 provider 正常写入并保留 token；临时程序已移除。服务与响应均为合成数据，不证明真实宿主或账号兼容性。
 
 **未验证：** 真实共享库加载、部署平台运行时 ABI、实际管理鉴权、真实账号接口、宿主内存与磁盘持久化兼容性。UT 和源码核对不能证明这些运行时性质；不安排真实宿主/账号 smoke。
