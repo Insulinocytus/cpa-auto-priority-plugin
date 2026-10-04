@@ -33,15 +33,13 @@ func (s *Synchronizer) devin(ctx context.Context, file authFile) ([]time.Time, s
 	}
 	periods := map[int64]time.Time{}
 	for duration, raw := range map[int64]json.RawMessage{7 * 86400: response.UserStatus.PlanStatus.Weekly, 86400: response.UserStatus.PlanStatus.Daily} {
-		// Proto3 JSON omits unset int64 values; an explicit zero is also unset.
-		if len(raw) == 0 || isNull(raw) || string(raw) == "0" || string(raw) == `"0"` {
-			continue
-		}
-		reset, err := unixSeconds(raw)
+		reset, known, err := optionalUnixSeconds(raw)
 		if err != nil {
 			return nil, "quota_response_malformed"
 		}
-		periods[duration] = reset
+		if known {
+			periods[duration] = reset
+		}
 	}
 	return ordered(periods)
 }

@@ -564,8 +564,9 @@ func TestSyncDevinWeeklyBeforeDailyInUnixSeconds(t *testing.T) {
 	// planEnd is subscription lifetime, not a quota reset.
 	s.usage["plan-only"] = []string{devinStatus(``, ``)}
 	s.usage["codex"] = []string{`{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"reset_at":1}}}`}
-	// Proto3 zero means unset; a non-numeric reset is malformed, not absent.
-	s.usage["unset"] = []string{devinStatus(`,"weeklyQuotaResetAtUnix":"0"`, `,"dailyQuotaResetAtUnix":0`)}
+	// Like the official parser, non-positive values are an unknown layer; a
+	// non-numeric reset is malformed, not absent.
+	s.usage["unset"] = []string{devinStatus(`,"weeklyQuotaResetAtUnix":"0"`, `,"dailyQuotaResetAtUnix":-5`)}
 	s.usage["broken"] = []string{devinStatus(`,"weeklyQuotaResetAtUnix":"next week"`, `,"dailyQuotaResetAtUnix":"1798675200"`)}
 	round, err := synchronizer(t, s).Sync(context.Background())
 	if err != nil {
@@ -664,6 +665,7 @@ func TestSyncMetaUnknownQuotaFailuresAndRetryIsolation(t *testing.T) {
 		{"no-subs-usage", []string{`{"api_key":"meta-returned-key","is_subs_active":false}`}, 200, 0, -1, 1, 1, "no_reset_time"},
 		{"null-resets", []string{`{"subs_usage":{"window":null,"weekly":{"used_percent":0,"resets_at":null}}}`}, 200, 0, -1, 1, 1, "no_reset_time"},
 		{"weekly-only", []string{`{"subs_usage":{"weekly":{"resets_at":"1798761600"}}}`}, 200, 0, 1, 1, 1, "ok"},
+		{"non-positive-window", []string{`{"subs_usage":{"window":{"resets_at":0},"weekly":{"resets_at":1798761600}}}`}, 200, 0, 1, 1, 1, "ok"},
 		{"not-json", []string{`<html>meta-returned-key</html>`}, 200, 0, -1, 1, 2, "quota_response_malformed"},
 		{"bad-usage", []string{`{"subs_usage":[]}`}, 200, 0, -1, 1, 2, "quota_response_malformed"},
 		{"bad-reset", []string{metaUsage(`"soon"`, "1798761600")}, 200, 0, -1, 1, 2, "quota_response_malformed"},

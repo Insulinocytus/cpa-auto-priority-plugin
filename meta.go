@@ -51,28 +51,32 @@ func (s *Synchronizer) meta(ctx context.Context, file authFile, dca string) ([]t
 		return nil, "no_reset_time"
 	}
 	var usage struct {
-		Window *metaWindow `json:"window"`
-		Weekly *metaWindow `json:"weekly"`
+		// A null window decodes to the zero value: an unknown layer.
+		Window metaWindow `json:"window"`
+		Weekly metaWindow `json:"weekly"`
 	}
 	if json.Unmarshal(response.Usage, &usage) != nil {
 		return nil, "quota_response_malformed"
 	}
 	periods := map[int64]time.Time{}
-	if usage.Weekly != nil && len(usage.Weekly.Reset) > 0 && !isNull(usage.Weekly.Reset) {
-		reset, err := unixSeconds(usage.Weekly.Reset)
-		if err != nil {
-			return nil, "quota_response_malformed"
-		}
-		periods[7*86400] = reset
+	weekly, known, err := optionalUnixSeconds(usage.Weekly.Reset)
+	if err != nil {
+		return nil, "quota_response_malformed"
 	}
-	if usage.Window != nil && len(usage.Window.Reset) > 0 && !isNull(usage.Window.Reset) {
-		reset, err := unixSeconds(usage.Window.Reset)
+	if known {
+		periods[7*86400] = weekly
+	}
+	window, known, err := optionalUnixSeconds(usage.Window.Reset)
+	if err != nil {
+		return nil, "quota_response_malformed"
+	}
+	if known {
 		// The rolling window's period is only known from its duration.
-		minutes, minutesErr := number(usage.Window.Minutes)
-		if err != nil || minutesErr != nil || minutes <= 0 || minutes != math.Trunc(minutes) || minutes >= float64(math.MaxInt64/60) {
+		minutes, err := number(usage.Window.Minutes)
+		if err != nil || minutes <= 0 || minutes != math.Trunc(minutes) || minutes >= float64(math.MaxInt64/60) {
 			return nil, "quota_response_malformed"
 		}
-		if !addPeriod(periods, int64(minutes)*60, reset) {
+		if !addPeriod(periods, int64(minutes)*60, window) {
 			return nil, "quota_period_ambiguous"
 		}
 	}
