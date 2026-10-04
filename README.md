@@ -1,6 +1,6 @@
 # CPA Auto Priority
 
-CLIProxyAPI 原生 Go 插件：宿主管理接口就绪后立即执行一轮 Codex、Antigravity、Devin、Meta、Kimi、xAI **自然额度重置** priority 同步，并让 Codex **有效重置卡**参与排序，此后按标准五字段 cron 重复执行同一完整同步入口。对应 [issue #2](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/2)、[issue #3](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/3)、[issue #5](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/5)、[issue #6](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/6)、[issue #7](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/7) 与 [issue #8](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/8)。其他 provider 查询由各自接入工单实现。
+CLIProxyAPI 原生 Go 插件：宿主管理接口就绪后立即执行一轮 Codex、Claude、Antigravity、Devin、Meta、Kimi、xAI **自然额度重置** priority 同步，并让 Codex 与 Claude **有效重置卡**参与排序，此后按标准五字段 cron 重复执行同一完整同步入口。对应 [issue #2](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/2)、[issue #3](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/3)、[issue #4](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/4)、[issue #5](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/5)、[issue #6](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/6)、[issue #7](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/7) 与 [issue #8](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/8)。其他 provider 查询由各自接入工单实现。
 
 ## 构建与配置
 
@@ -60,8 +60,20 @@ Authorization: Bearer <management key>
 8. 当前已查证的重置卡类型是 `reset_type=codex_rate_limits`、`status=available` 的一次性权益：要求合法 `granted_at` 且不晚于本次卡响应观测时间；有到期时间时必须晚于观测时间和授予时间。`redeeming`、`redeemed`、其他非 available 状态、未来授予及已到期卡均不参与；`expires_at` 缺失/null 按第一方可选字段契约表示不过期，没有可提前排序的到期时刻。多张有效卡取最早到期，与该卡适用的自然时间取 min；相等不加档位，卡不创建缺失窗口。
    当前已查证的重置卡类型（`codex_rate_limits`）仅作用于通用周（604800 秒）和五小时（18000 秒）层；**未查证月卡、其他周期或模型专属卡契约，不声称这些接口已支持或不存在**。月层保留自然时间，周卡不能覆盖月时间。`applicable_available_count` 不是持有卡数量，其计算公式未查证；不以它为零或账号未触及 limit 排除有效卡，也不按使用率、剩余额度量或耗尽状态排序。
 9. 同 provider 内比较各自最长周期的排序时间；越早越优先，相同才比较下一层，有下一层优先于没有下一层。时间序列完全相同共用档位。正常档位从最低 0 连续向上编号，不按套餐、文件名、输入顺序或额度量拆组。
-10. 必要请求（额度、卡、Meta DCA 下载）失败/malformed 仅重试失败请求一次；成功额度不因卡失败重复请求，成功 DCA 下载不因额度失败重做。仍失败、401 明确失效、缺少 DCA、无任何可用自然重置、缺查询索引、未知 provider 均只将该物理认证设为 -1，其余继续。卡详情必须有非负整数 `available_count` 和实际 `credits` 数组；成功零卡与失败严格区分。后端可截断详情：available 行数不足汇总时为 `reset_card_details_incomplete`；数量矛盾或必要字段损坏为 `reset_card_response_malformed`；available 卡类型未知为 `reset_card_applicability_unknown`，都不假造“无卡”。成功确认缺少/null 的短窗口不是失败；已有窗口的损坏周期/时间是失败。有效窗口的时间明确为 null/缺失时不虚构时间。不会拿订阅或 token 过期代替重置时间。宿主的 `disabled` 状态不影响查询与排序，插件也从不改变它。
+10. 必要请求（额度、卡、Meta DCA 下载）失败/malformed 仅重试失败请求一次；成功额度不因卡失败重复请求，成功 DCA 下载不因额度失败重做。仍失败、401 明确失效、缺少 DCA、无任何可用自然重置、缺查询索引、未知 provider 均只将该物理认证设为 -1，其余继续。Codex 卡详情必须有非负整数 `available_count` 和实际 `credits` 数组；成功零卡与失败严格区分。后端可截断详情：available 行数不足汇总时为 `reset_card_details_incomplete`；数量矛盾或必要字段损坏为 `reset_card_response_malformed`；available 卡类型未知为 `reset_card_applicability_unknown`，都不假造“无卡”。Claude 卡契约见下节。成功确认缺少/null 的短窗口不是失败；已有窗口的损坏周期/时间是失败。有效窗口的时间明确为 null/缺失时不虚构时间。不会拿订阅或 token 过期代替重置时间。宿主的 `disabled` 状态不影响查询与排序，插件也从不改变它。
 11. 写前再次确认启用状态，仅 `PATCH /v8/management/credentials/fields {"name":"<id>","priority":N}`。不提交完整 auth JSON，不改变 disabled、token、DCA token、代理或其他业务字段。写入失败返回 `write_status=failed`，不重试、不回滚，继续尝试其他认证；HTTP 2xx 且 `status=ok` 仅为 `acknowledged`，**从不声称磁盘持久化已验证**。
+
+### Claude
+
+沿用上述 YAML，不新增 provider 配置。宿主须已有 `provider=claude` 的物理 OAuth 认证文件与 `auth_index`；不下载 token、不使用 Codex 账号 header、不请求 profile/组织或按套餐拆组。经同一管理代发接口分别 GET `https://api.anthropic.com/api/oauth/usage` 和 `https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1`；两者均使用 `Authorization: Bearer $TOKEN$`、`anthropic-beta: oauth-2025-04-20`、`Content-Type: application/json`、`User-Agent: claude-cli/2.1.280 (external, cli)`，由宿主选择认证和代理，不覆盖 `proxy_url`。这些是 pinned 管理界面的客户端 headers，不是已证明的最低客户端版本或全部服务端必需项。
+
+自然时间只取通用 `seven_day.resets_at`（604800 秒）和 `five_hour.resets_at`（18000 秒），按带时区的 RFC3339/ISO 字符串解析；缺失/null 为缺层，损坏的通用窗口或日期为 malformed。`seven_day_opus/sonnet/oauth_apps/cowork`、`iguana_necktie`、`limits[].kind=weekly_scoped` 是模型/用途专属周约束，不是月层或更短周期；无查证的归并公式，不取其 min/max，不回退到某个模型。`extra_usage.monthly_limit` 是额外用量上限，不是月额度重置；token/订阅到期、卡状态的 `weekly_resets_at` 与 `cooldown_until` 不代替自然时间。
+
+卡状态须有对象 `cedar_ember`、boolean `eligible` 和明确的 `grants` 数组；缺失/null 数组不冒充成功零卡（比界面默认空数组更严格）。每卡必须有非空唯一 `id`、非负整数 `resets_total/resets_left`，且剩余不大于总数；optional `starts_at/ends_at` 只接受 ISO 字符串，缺失/null 表示没有该时间边界，不虚构到期。资格为真、未暂停、剩余大于零、已生效且未到期才参与；有界日期逆序为 malformed。已生效卡的 `clears` 必须明确：`seven_day` 只影响通用周、`five_hour` 只影响五小时；`seven_day_overage_included` 不冒充通用周，空数组无适用周期，未知或缺失 clears 为 `reset_card_applicability_unknown`。未查证 Claude 月窗口/月卡契约。
+
+`usable_now=false`、`use_requires_limit=true`、`at_limit=false` 和暂时 cooldown **不单独取消持有权益**；资格、暂停、次数和时间边界仍遵守。`usable_now/use_requires_limit` 只校验 boolean 类型，不参与排名；其服务端完整计算原因未公开，不能宣称 false 必然仅由未触及 limit 导致。每周期取适用有效卡最早有限到期与自然时间的较早者；无到期卡不提前排序，卡不创建缺层。自然/卡查询分别重试一次，卡失败不重查成功自然额度；仍失败仅此认证 -1；管理 401/403 仍终止整轮。Claude 与 Codex 同轮独立编号，仍只用原有 priority 窄 PATCH。
+
+证据来自固定版本管理界面和 Anthropic [limit reset 说明](https://support.claude.com/en/articles/17007452-what-is-a-limit-reset)，详见 [Claude 契约调查](docs/research/cliproxyapi-contracts.md#claude-自然窗口与重置权益)。产品说明允许未达上限就使用，并说明取消/降级可失去权益；**没有公开保证 `cedar_ember` 私有字段及全部失效原因**，界面实现不是 Anthropic 正式 schema。响应按源码形状合成，未采集真实账号；UT 不证明实验性 GET 已在上游运行成功。
 
 ### Antigravity
 
@@ -143,9 +155,13 @@ Devin 覆盖周先于日、Unix 秒字符串/数字、套餐期限不参与、pr
 
 Antigravity UT 另覆盖项目定位与请求契约、多组同周期合并与冲突、未查证窗口、snake_case/时区/Unix 时间、缺项目、两次尝试的地址顺序与失败隔离、与 Codex 混合时独立档位。
 
+Claude 定向 UT：`go test . -run TestSyncClaude -count=1`。覆盖通用与模型专属窗口区分、周优先/缺层/同档/输入顺序、OAuth/代理契约、尚不可消费但仍有效、多卡与逐周期 precedence、生效/到期边界、资格/暂停/耗尽、无到期、未知月卡、自然/卡各自重试、失败响应的部分卡不污染重试、混合 Codex 独立档位、连续轮次新权益状态、受控存储仅 priority 变化与并发 token 保留、敏感响应不泄露，以及管理/上游双层鉴权状态。
+
 重新启用回归 UT 暂停旧轮次的禁用响应，在同配置 reconfigure 后才交付；验证旧 worker 取消并退出、新 worker 等待宿主启用发布、按最新额度重新排序，以及后续 cron 继续更新 priority。
 
 issue #2 实现阶段另外完成 Windows `c-shared` 编译（未加载）和无网络、受控 transport 的单轮入口运行检查；临时程序与构建产物已移除。这些历史检查不证明真实宿主或磁盘兼容性。issue #3 重置卡改动与 issue #8 调度改动只做确定性 UT，不安排 smoke、真实加载或真实账号请求。
+
+Claude 改动另用临时无网络、受控 transport 程序直接执行同一 `Sync`：观察持有卡时受控存储为 `held:1/natural:0`，下一轮移除卡后为 `held:0/natural:1`。临时程序已移除；该入口运行检查同样只使用合成数据，不证明实验性上游接口、真实宿主加载或实际磁盘持久化。
 
 PR #12 合并验证另用临时程序经过 loopback HTTP 服务运行混合 Codex/Kimi/xAI `Sync`：确认 Codex 卡到期参与排序、卡查询失败仅重试一次且不重查成功额度、失败仅影响该认证、其他 provider 正常写入并保留 token；临时程序已移除。服务与响应均为合成数据，不证明真实宿主或账号兼容性。
 

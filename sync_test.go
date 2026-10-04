@@ -112,7 +112,7 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 		if err := json.NewDecoder(req.Body).Decode(&call); err != nil {
 			return nil, err
 		}
-		isCard := call.URL == "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+		isCard := call.URL == "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits" || call.URL == claudeCardsURL
 		if call.ProxyURL != nil || (call.Header["Authorization"] != "Bearer $TOKEN$" && !validUpstreamCall(call.Method, call.URL, call.Header, call.Data)) {
 			return jsonResponse(400, map[string]any{"error": "invalid query contract"}), nil
 		}
@@ -142,6 +142,10 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 		case "codex":
 			if !isCard && call.URL != codexURL {
 				return jsonResponse(400, map[string]any{"error": "wrong codex endpoint"}), nil
+			}
+		case "claude":
+			if (call.URL != claudeURL && call.URL != claudeCardsURL) || call.Header["Authorization"] != "Bearer $TOKEN$" || call.Header["anthropic-beta"] != "oauth-2025-04-20" || call.Header["Content-Type"] != "application/json" || call.Header["User-Agent"] != "claude-cli/2.1.280 (external, cli)" || call.Header["Chatgpt-Account-Id"] != "" || call.Data != "" {
+				return jsonResponse(400, map[string]any{"error": "wrong claude OAuth contract"}), nil
 			}
 		case "devin":
 			if call.URL != devinURL || !validUpstreamCall(call.Method, call.URL, call.Header, call.Data) {
@@ -174,7 +178,7 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 		s.accountID = call.Header["Chatgpt-Account-Id"]
 		if isCard {
-			if call.Header["OpenAI-Beta"] != "codex-1" || call.Header["Originator"] != "Codex Desktop" || call.Header["Accept"] != "application/json" {
+			if selected["provider"] == "codex" && (call.Header["OpenAI-Beta"] != "codex-1" || call.Header["Originator"] != "Codex Desktop" || call.Header["Accept"] != "application/json") {
 				return jsonResponse(400, map[string]any{"error": "invalid card contract"}), nil
 			}
 			index := s.cardQueryCount[call.AuthIndex]
@@ -182,6 +186,9 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 			responses := s.cards[call.AuthIndex]
 			if len(responses) == 0 {
 				responses = []string{`{"credits":[],"available_count":0,"applicable_available_count":0}`}
+				if selected["provider"] == "claude" {
+					responses = []string{`{"cedar_ember":{"eligible":true,"grants":[]}}`}
+				}
 			}
 			if index >= len(responses) {
 				index = len(responses) - 1

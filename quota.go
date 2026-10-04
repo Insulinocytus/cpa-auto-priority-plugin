@@ -25,6 +25,11 @@ func (s *Synchronizer) quota(ctx context.Context, file authFile, uniqueName bool
 		}
 		// Codex owns usage and card retries separately; never replay both.
 		return s.codex(ctx, file)
+	case "claude":
+		if file.Index == "" {
+			return nil, "missing_auth_index"
+		}
+		return s.claude(ctx, file)
 	case "antigravity":
 		if file.Index == "" {
 			return nil, "missing_auth_index"
