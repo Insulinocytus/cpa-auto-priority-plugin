@@ -82,7 +82,10 @@ type authFile struct {
 	Source      string `json:"source"`
 	Path        string `json:"path"`
 	RuntimeOnly *bool  `json:"runtime_only"`
-	IDToken     struct {
+	// The host exposes the project its Antigravity executor uses
+	// (metadata.project_id); no raw auth JSON is downloaded for it.
+	ProjectID string `json:"project_id"`
+	IDToken   struct {
 		AccountID string `json:"chatgpt_account_id"`
 	} `json:"id_token"`
 }
@@ -120,6 +123,22 @@ func (s *Synchronizer) request(ctx context.Context, method, path string, body an
 		return &managementHTTPError{response.StatusCode}
 	}
 	return nil
+}
+
+// A failed required quota query is retried once: two requests at most.
+const queryAttempts = 2
+
+// quotaPeriods holds one natural reset time per quota period, in seconds.
+type quotaPeriods map[int64]time.Time
+
+// add reports false for a second, different reset in the same period: no
+// upstream contract says which same-period constraint is representative.
+func (p quotaPeriods) add(seconds int64, reset time.Time) bool {
+	if previous, exists := p[seconds]; exists && !reset.Equal(previous) {
+		return false
+	}
+	p[seconds] = reset
+	return true
 }
 
 // The host removes capabilities on disable without notifying the library.

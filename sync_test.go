@@ -25,6 +25,7 @@ type managementStore struct {
 	cardStatus     map[string]int
 	cardQueryCount map[string]int
 	queryCount     map[string]int
+	queryURLs      map[string][]string
 	writeCount     map[string]int
 	writeFailure   map[string]bool
 	downloadCount  map[string]int
@@ -51,7 +52,7 @@ const (
 )
 
 func store(files ...map[string]any) *managementStore {
-	return &managementStore{files: files, usage: map[string][]string{}, cards: map[string][]string{}, cardStatus: map[string]int{}, cardQueryCount: map[string]int{}, upstreamStatus: map[string]int{}, queryCount: map[string]int{}, writeCount: map[string]int{}, writeFailure: map[string]bool{}, downloadCount: map[string]int{}, downloadFail: map[string]int{}, metadata: map[string]string{}, metadataCount: map[string]int{}, expectedURL: map[string]string{}, expectedUserID: map[string]string{}, key: "management-secret"}
+	return &managementStore{files: files, usage: map[string][]string{}, cards: map[string][]string{}, cardStatus: map[string]int{}, cardQueryCount: map[string]int{}, upstreamStatus: map[string]int{}, queryCount: map[string]int{}, queryURLs: map[string][]string{}, writeCount: map[string]int{}, writeFailure: map[string]bool{}, downloadCount: map[string]int{}, downloadFail: map[string]int{}, metadata: map[string]string{}, metadataCount: map[string]int{}, expectedURL: map[string]string{}, expectedUserID: map[string]string{}, key: "management-secret"}
 }
 
 func credential(name, provider string) map[string]any {
@@ -112,7 +113,7 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 			return nil, err
 		}
 		isCard := call.URL == "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
-		if call.ProxyURL != nil || ((call.Method != "GET" || call.Header["Authorization"] != "Bearer $TOKEN$") && !validUpstreamCall(call.Method, call.URL, call.Header, call.Data)) {
+		if call.ProxyURL != nil || (call.Header["Authorization"] != "Bearer $TOKEN$" && !validUpstreamCall(call.Method, call.URL, call.Header, call.Data)) {
 			return jsonResponse(400, map[string]any{"error": "invalid query contract"}), nil
 		}
 		var selected map[string]any
@@ -127,6 +128,9 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 		if selected == nil {
 			return jsonResponse(400, map[string]any{"error": "missing auth"}), nil
+		}
+		if selected["provider"] != "antigravity" && selected["provider"] != "devin" && selected["provider"] != "meta" && call.Method != "GET" {
+			return jsonResponse(400, map[string]any{"error": "invalid query contract"}), nil
 		}
 		if expected := s.expectedURL[call.AuthIndex]; expected != "" && call.URL != expected {
 			return jsonResponse(400, map[string]any{"error": "account quota is only available on its own domain"}), nil
@@ -146,6 +150,13 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 		case "meta":
 			if call.URL != metaURL || !validUpstreamCall(call.Method, call.URL, call.Header, call.Data) {
 				return jsonResponse(400, map[string]any{"error": "wrong meta quota contract"}), nil
+			}
+		case "antigravity":
+			// Official endpoints and the project exposed for the selected auth.
+			project, _ := json.Marshal(map[string]any{"project": selected["project_id"]})
+			official := map[string]bool{dailyQuotaURL: true, sandboxQuotaURL: true, "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary": true}
+			if call.Method != "POST" || !official[call.URL] || call.Header["User-Agent"] != "antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)" || call.Data != string(project) {
+				return jsonResponse(400, map[string]any{"error": "invalid query contract"}), nil
 			}
 		case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
 			if call.URL != "https://api.kimi.com/coding/v1/usages" && call.URL != "https://api.kimi.ai/coding/v1/usages" {
@@ -181,6 +192,7 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 			}
 			return jsonResponse(200, map[string]any{"status_code": status, "body": responses[index]}), nil
 		}
+		s.queryURLs[call.AuthIndex] = append(s.queryURLs[call.AuthIndex], call.URL)
 		index := s.queryCount[call.AuthIndex]
 		s.queryCount[call.AuthIndex]++
 		if s.disableOnQuery {
@@ -676,7 +688,7 @@ func TestSyncMetaUsesPersistedDCAAndRanksWithOtherProvidersInOneRound(t *testing
 	notDCA["dca_token"] = "llm-key-not-dca"
 	disabled := metaCredential("disabled-early")
 	disabled["disabled"] = true
-	s := store(metaCredential("late"), disabled, llmOnly, notDCA, metaCredential("same-week"), credential("devin", "devin"), credential("codex", "codex"), credential("kimi.json", "kimi"), credential("xai.json", "xai"))
+	s := store(metaCredential("late"), disabled, llmOnly, notDCA, metaCredential("same-week"), credential("devin", "devin"), credential("codex", "codex"), credential("kimi.json", "kimi"), credential("xai.json", "xai"), antigravity("antigravity"))
 	s.usage["late"] = []string{metaUsage("1798700000", "1798848000")}
 	s.usage["disabled-early"] = []string{metaUsage("1798700000", "1798761600")}
 	s.usage["same-week"] = []string{metaUsage("1798710000", "1798761600")}
@@ -688,6 +700,7 @@ func TestSyncMetaUsesPersistedDCAAndRanksWithOtherProvidersInOneRound(t *testing
 	s.usage["kimi.json"] = []string{`{"usages":{"limit_month_total":{"reset_time":"2026-10-20T00:00:00Z"}}}`}
 	s.metadata["xai.json"] = `{"type":"xai","auth_kind":"oauth"}`
 	s.usage["xai.json"] = []string{`{"config":{"currentPeriod":{"type":"USAGE_PERIOD_TYPE_WEEKLY","end":"2026-10-08T00:00:00Z"}}}`}
+	s.usage["antigravity"] = []string{`{"groups":[{"buckets":[{"window":"weekly","resetTime":"2026-10-08T00:00:00Z"}]}]}`}
 	before := map[string]map[string]any{}
 	for _, file := range s.files {
 		copy := map[string]any{}
@@ -700,7 +713,7 @@ func TestSyncMetaUsesPersistedDCAAndRanksWithOtherProvidersInOneRound(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]int{"late": 0, "same-week": 1, "disabled-early": 2, "llm-only": -1, "not-dca": -1, "devin": 0, "codex": 0, "kimi.json": 0, "xai.json": 0}
+	want := map[string]int{"late": 0, "same-week": 1, "disabled-early": 2, "llm-only": -1, "not-dca": -1, "devin": 0, "codex": 0, "kimi.json": 0, "xai.json": 0, "antigravity": 0}
 	for _, file := range s.files {
 		name := file["name"].(string)
 		before[name]["priority"] = want[name]

@@ -58,7 +58,7 @@ func (s *Synchronizer) meta(ctx context.Context, file authFile, dca string) ([]t
 	if json.Unmarshal(response.Usage, &usage) != nil {
 		return nil, "quota_response_malformed"
 	}
-	periods := map[int64]time.Time{}
+	periods := quotaPeriods{}
 	weekly, known, err := optionalUnixSeconds(usage.Weekly.Reset)
 	if err != nil {
 		return nil, "quota_response_malformed"
@@ -76,7 +76,7 @@ func (s *Synchronizer) meta(ctx context.Context, file authFile, dca string) ([]t
 		if err != nil || minutes <= 0 || minutes != math.Trunc(minutes) || minutes >= float64(math.MaxInt64/60) {
 			return nil, "quota_response_malformed"
 		}
-		if !addPeriod(periods, int64(minutes)*60, window) {
+		if !periods.add(int64(minutes)*60, window) {
 			return nil, "quota_period_ambiguous"
 		}
 	}

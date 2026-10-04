@@ -25,6 +25,19 @@ func (s *Synchronizer) quota(ctx context.Context, file authFile, uniqueName bool
 		}
 		// Codex owns usage and card retries separately; never replay both.
 		return s.codex(ctx, file)
+	case "antigravity":
+		if file.Index == "" {
+			return nil, "missing_auth_index"
+		}
+		if strings.TrimSpace(file.ProjectID) == "" {
+			return nil, "missing_project_id"
+		}
+		attempt := 0
+		query = func() ([]time.Time, string) {
+			sequence, status := s.antigravity(ctx, file, attempt)
+			attempt++
+			return sequence, status
+		}
 	case "devin":
 		query = func() ([]time.Time, string) { return s.devin(ctx, file) }
 	case "meta":
@@ -144,16 +157,6 @@ func unix(text string, detectMilliseconds bool) (time.Time, error) {
 	nanos.Mul(&nanos, big.NewInt(int64(time.Second)))
 	nanos.Quo(&nanos, exact.Denom())
 	return time.Unix(seconds.Int64(), nanos.Int64()).UTC(), nil
-}
-
-// No upstream contract explains distinct resets for duplicate generic periods.
-// Do not guess which constraint is representative.
-func addPeriod(periods map[int64]time.Time, duration int64, reset time.Time) bool {
-	if previous, exists := periods[duration]; exists && !reset.Equal(previous) {
-		return false
-	}
-	periods[duration] = reset
-	return true
 }
 
 // ordered lists reset instants from the longest quota period to the shortest.
