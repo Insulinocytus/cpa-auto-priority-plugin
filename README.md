@@ -1,6 +1,6 @@
 # CPA Auto Priority
 
-CLIProxyAPI 原生 Go 插件：宿主管理接口就绪后立即执行一轮 Codex **自然额度重置** priority 同步。对应 [issue #2](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/2)。不实现后续工单的 cron、重置卡或其他 provider 查询。
+CLIProxyAPI 原生 Go 插件：宿主管理接口就绪后立即执行一轮 Codex 与 Antigravity **自然额度重置** priority 同步。对应 [issue #2](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/2)、[issue #6](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/6)。不实现后续工单的 cron、重置卡或其他 provider 查询。
 
 ## 构建与配置
 
@@ -51,6 +51,9 @@ Authorization: Bearer <management key>
 5. 按明确的正整数 `limit_window_seconds` 从长到短组织时间序列；604800 秒是周，18000 秒是五小时。沿用官方管理界面分类，28–31 日统一为月层；其他明确周期按其秒数排序，不猜成周。ISO/RFC3339、Unix 秒/毫秒（官方 helper 的 `1e11` 分界）、numeric string 和相对秒数归一化为绝对时刻。相对值锚定该响应接收时刻，每轮重新观测。
    Unix 数值保留原单位的整数/十进制精度，等价的 ISO 与非整秒 Unix 编码不会因浮点转换被拆成不同档位。
 6. 相同周期、相同重置时刻合为一层；同周期不同重置时刻在上游没有查证的代表窗口契约，返回 `quota_period_ambiguous`，重试一次仍不明确则该认证为 -1。**不擅自取 min/max 或按槽位选代表窗口**。
+   Antigravity 的项目取自宿主列表条目的 `project_id`（宿主 `authProjectID` 读取 auth metadata 的 `project_id`，其次 attributes；Antigravity executor 本身也只用 metadata `project_id`）。缺项目时为 `missing_project_id`，不查询、不重试，该认证为 -1；不下载、不记录、不回写完整 auth JSON，也不调用 `loadCodeAssist` 补项目。经同一 `requests/api-call` 代发 `POST .../v1internal:retrieveUserQuotaSummary`，`data` 为 `{"project":"<project_id>"}`，headers 与官方界面相同（`Bearer $TOKEN$`、JSON、`antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)`），不覆盖代理。宿主对 Antigravity 的 `$TOKEN$` 先按所选认证代理刷新 OAuth token。
+   官方界面一次读取依次尝试 daily、daily sandbox、production 三个地址；本插件第 1 次请求 daily，失败后唯一一次重试请求 daily sandbox，总计最多两次，**不尝试 production、不叠加 fallback**。宿主生成请求同样默认 daily、不跨档 fallback。
+   只认 `groups[].buckets[]` 的 `window` 为 `5h/five-hour/five_hour`（五小时）或 `weekly/week`（周，大小写不敏感），时间取 `resetTime`，缺失/null/空串时取 `reset_time`，按第 5 点的 ISO/Unix 规则归一化。额度组是模型族（如 Gemini、Claude and GPT），不是额外周期：同周期各组重置时刻相同则合为一层；不同则 `quota_period_ambiguous`，**不按模型挑选、不取 min/max**。有重置时间但 `window` 缺失或未经查证（如 `daily`）返回 `quota_period_unverified`，不猜周期。两者重试一次仍如此则该认证为 -1。`groups` 缺失/null/非数组为 malformed；`groups` 为空或所有 bucket 都无重置时间为 `no_reset_time`。不读取 `remainingFraction`、套餐级别或订阅信息，响应 `Date` 推算的服务器时钟偏移只用于官方界面倒计时，不当作重置时间。未查证到 Antigravity 手动重置卡契约，不生成卡时间。
 7. 同 provider 内比较各自最长周期的时间；越早越优先，相同才比较下一层，有下一层优先于没有下一层。时间序列完全相同共用档位。正常档位从最低 0 连续向上编号，不按套餐、文件名、输入顺序或额度量拆组。
 8. 必要额度请求失败或 malformed 仅重试失败请求一次；仍失败、401 明确失效、无任何可用自然重置、缺查询索引、未知 provider 均只将该物理认证设为 -1，其余继续。成功确认缺少/null 的短窗口不是失败；已有窗口的损坏周期/时间是失败。有效窗口的时间明确为 null/缺失时不虚构时间。不会拿订阅或 token 过期代替重置时间。
 9. 写前再次确认启用状态，仅 `PATCH /v8/management/credentials/fields {"name":"<id>","priority":N}`。不提交完整 auth JSON，不改变 disabled、token、代理或其他业务字段。写入失败返回 `write_status=failed`，不重试、不回滚，继续尝试其他认证；HTTP 2xx 且 `status=ok` 仅为 `acknowledged`，**从不声称磁盘持久化已验证**。
@@ -75,18 +78,20 @@ Codex 基准：[官方管理界面 `ee79a79`](https://github.com/router-for-me/C
 - [周期、scope、请求 headers](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/ee79a794526a30c03748a8864a9ac6589a31833b/src/features/quota/providers/codex/data.ts#L68-L445)、[ISO/Unix/相对时间 helper](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/ee79a794526a30c03748a8864a9ac6589a31833b/src/utils/quota/resetInstants.ts#L23-L77)。
 - [上游脱敏格式 fixture](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/blob/ee79a794526a30c03748a8864a9ac6589a31833b/tests/codexQuota.test.ts#L28-L63) 含通用周窗口及独立 Spark 周窗口。UT 保留其自然额度形状，其他月/ISO/边界数据注明为合成输入；不声称采集过真实账号响应。
 
-**限制：** 没有跨文件事务，也没有跨探测/查询/写入的快照事务。宿主 disable 不通知仍加载的库，本插件依赖 `effective_enabled` 检查；检查后立刻 disable 或 auth 集合变化仍有 TOCTOU，窄 PATCH 的 virtual guard 继续保护虚拟认证。不同 provider 的编号独立计算，宿主混合 provider 路由仍可能跨 provider 比较最终数字；插件不改变路由规则。停止插件不会恢复此前已写入的 priority。
+Antigravity 基准同为官方管理界面 `ee79a79` 与宿主 `8ef43e4`，不是 Google 公开发布的 schema；窗口与项目证据见 [接口调查](docs/research/cliproxyapi-contracts.md#antigravity-额度组与项目)。上游没有 Antigravity fixture，UT 响应全部是按其类型定义构造的合成输入。
+
+**限制：** 没有跨文件事务，也没有跨探测/查询/写入的快照事务。宿主 disable 不通知仍加载的库，本插件依赖 `effective_enabled` 检查；检查后立刻 disable 或 auth 集合变化仍有 TOCTOU，窄 PATCH 的 virtual guard 继续保护虚拟认证。不同 provider 的编号独立计算，宿主混合 provider 路由仍可能跨 provider 比较最终数字；插件不改变路由规则。停止插件不会恢复此前已写入的 priority。Antigravity 认证若在 auth 中设置自定义 `base_url`（企业/GCP），宿主生成请求会使用该地址，但官方界面与本插件的额度查询仍用固定官方地址；若账号只能在 production 地址返回额度，两次尝试后为 -1。不同额度组的周重置不同时整份认证不可排序，这是未查证归并契约时的保守结果。
 
 ## 测试
 
 ```sh
-go test sync_test.go                         # 完整单轮 seam 的定向 UT
+go test -run Sync .                          # 完整单轮 seam 的定向 UT
 go test ./cmd/plugin -run 'TestStartup|TestShutdown|TestInvalid'
 go vet ./...                                # 类型/静态检查
 go test -race ./...                         # 最终完整 UT，含并发检查
 ```
 
-UT 使用固定时钟和有状态 HTTP transport adapter：不监听端口、不访问真实网络/账号、不加载真实宿主。覆盖多周期 precedence、跨套餐/缺层/同档、输入顺序、provider 隔离、ISO/秒/毫秒/相对时间及跨年、重试隔离、virtual/配置项排除、仅 priority 变化、并发 token 刷新保留、写入失败、显式鉴权/代理语义、敏感数据不泄露、配置注册/reconfigure/取消退出；管理读取、物理认证探测、额度代发及 priority 写入的 401/403 立即终止，修正密钥后可重新配置恢复。
+UT 使用固定时钟和有状态 HTTP transport adapter：不监听端口、不访问真实网络/账号、不加载真实宿主。覆盖多周期 precedence、跨套餐/缺层/同档、输入顺序、provider 隔离、ISO/秒/毫秒/相对时间及跨年、重试隔离、virtual/配置项排除、仅 priority 变化、并发 token 刷新保留、写入失败、显式鉴权/代理语义、敏感数据不泄露、配置注册/reconfigure/取消退出；管理读取、物理认证探测、额度代发及 priority 写入的 401/403 立即终止，修正密钥后可重新配置恢复。Antigravity 另覆盖项目定位与请求契约、多组同周期合并与冲突、未查证窗口、snake_case/时区/Unix 时间、缺项目、两次尝试的地址顺序与失败隔离、与 Codex 混合时独立档位。
 
 实现阶段另外完成 Windows `c-shared` 编译（未加载）和无网络、受控 transport 的单轮入口运行检查；临时程序与构建产物已移除。这些检查同样不证明真实宿主或磁盘兼容性。
 

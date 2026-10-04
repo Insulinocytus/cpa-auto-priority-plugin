@@ -7,41 +7,24 @@ import (
 	"errors"
 	"math"
 	"math/big"
-	"sort"
 	"strconv"
 	"time"
 )
 
-func (s *Synchronizer) codex(ctx context.Context, file authFile) ([]time.Time, string) {
+func (s *Synchronizer) codex(ctx context.Context, file authFile, _ int) ([]time.Time, string) {
 	headers := map[string]string{"Authorization": "Bearer $TOKEN$", "Content-Type": "application/json", "User-Agent": "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)"}
 	if file.IDToken.AccountID != "" {
 		headers["Chatgpt-Account-Id"] = file.IDToken.AccountID
 	}
-	call := struct {
-		AuthIndex string            `json:"auth_index"`
-		Method    string            `json:"method"`
-		URL       string            `json:"url"`
-		Header    map[string]string `json:"header"`
-	}{file.Index, "GET", "https://chatgpt.com/backend-api/wham/usage", headers}
-	var response struct {
-		Status int    `json:"status_code"`
-		Body   string `json:"body"`
-	}
-	if err := s.request(ctx, "POST", "requests/api-call", call, &response); err != nil {
-		return nil, err.Error()
-	}
-	if response.Status == 401 {
-		return nil, "credentials_invalid"
-	}
-	if response.Status < 200 || response.Status >= 300 {
-		return nil, "upstream_http_failed"
+	payload, status := s.upstream(ctx, apiCall{AuthIndex: file.Index, Method: "GET", URL: "https://chatgpt.com/backend-api/wham/usage", Header: headers})
+	if status != "ok" {
+		return nil, status
 	}
 	observed := s.now()
 	var usage struct {
 		RateLimit json.RawMessage `json:"rate_limit"`
 	}
-	payload := bytes.TrimSpace([]byte(response.Body))
-	if len(payload) == 0 || payload[0] != '{' || json.Unmarshal(payload, &usage) != nil {
+	if json.Unmarshal(payload, &usage) != nil {
 		return nil, "quota_response_malformed"
 	}
 	if len(usage.RateLimit) == 0 || isNull(usage.RateLimit) {
@@ -56,7 +39,7 @@ func (s *Synchronizer) codex(ctx context.Context, file authFile) ([]time.Time, s
 	}
 	// Only the account-wide rate_limit is comparable. Code review and named
 	// additional_rate_limits are separate uses/models, not extra account periods.
-	periods := map[int64]time.Time{}
+	periods := quotaPeriods{}
 	for _, raw := range []json.RawMessage{limits.Primary, limits.Secondary} {
 		if len(raw) == 0 || isNull(raw) {
 			continue
@@ -94,26 +77,14 @@ func (s *Synchronizer) codex(ctx context.Context, file authFile) ([]time.Time, s
 		if err != nil {
 			return nil, "quota_response_malformed"
 		}
-		// No upstream contract explains distinct resets for duplicate generic
-		// periods. Do not guess which constraint is representative.
-		if previous, exists := periods[duration]; exists && !reset.Equal(previous) {
+		if !periods.add(duration, reset) {
 			return nil, "quota_period_ambiguous"
 		}
-		periods[duration] = reset
 	}
 	if len(periods) == 0 {
 		return nil, "no_reset_time"
 	}
-	durations := make([]int64, 0, len(periods))
-	for duration := range periods {
-		durations = append(durations, duration)
-	}
-	sort.Slice(durations, func(i, j int) bool { return durations[i] > durations[j] })
-	sequence := make([]time.Time, 0, len(durations))
-	for _, duration := range durations {
-		sequence = append(sequence, periods[duration])
-	}
-	return sequence, "ok"
+	return periods.sequence(), "ok"
 }
 
 func isNull(raw json.RawMessage) bool { return bytes.Equal(bytes.TrimSpace(raw), []byte("null")) }

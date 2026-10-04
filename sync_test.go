@@ -22,6 +22,7 @@ type managementStore struct {
 	usage          map[string][]string
 	upstreamStatus map[string]int
 	queryCount     map[string]int
+	queryURLs      map[string][]string
 	writeCount     map[string]int
 	writeFailure   map[string]bool
 	key            string
@@ -36,7 +37,7 @@ type managementStore struct {
 }
 
 func store(files ...map[string]any) *managementStore {
-	return &managementStore{files: files, usage: map[string][]string{}, upstreamStatus: map[string]int{}, queryCount: map[string]int{}, writeCount: map[string]int{}, writeFailure: map[string]bool{}, key: "management-secret"}
+	return &managementStore{files: files, usage: map[string][]string{}, upstreamStatus: map[string]int{}, queryCount: map[string]int{}, queryURLs: map[string][]string{}, writeCount: map[string]int{}, writeFailure: map[string]bool{}, key: "management-secret"}
 }
 
 func credential(name, provider string) map[string]any {
@@ -72,20 +73,44 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 			Method    string            `json:"method"`
 			URL       string            `json:"url"`
 			Header    map[string]string `json:"header"`
+			Data      string            `json:"data"`
 			ProxyURL  *string           `json:"proxy_url"`
 		}
 		if err := json.NewDecoder(req.Body).Decode(&call); err != nil {
 			return nil, err
 		}
-		if call.Method != "GET" || call.URL != "https://chatgpt.com/backend-api/wham/usage" || call.Header["Authorization"] != "Bearer $TOKEN$" || call.ProxyURL != nil {
-			return jsonResponse(400, map[string]any{"error": "invalid query contract"}), nil
-		}
+		var selected map[string]any
 		for _, file := range s.files {
 			if file["auth_index"] == call.AuthIndex {
-				s.selectedProxy, _ = file["proxy_url"].(string)
+				selected = file
 			}
 		}
-		s.accountID = call.Header["Chatgpt-Account-Id"]
+		if selected == nil || call.Header["Authorization"] != "Bearer $TOKEN$" || call.ProxyURL != nil {
+			return jsonResponse(400, map[string]any{"error": "invalid query contract"}), nil
+		}
+		switch selected["provider"] {
+		case "codex":
+			if call.Method != "GET" || call.URL != "https://chatgpt.com/backend-api/wham/usage" {
+				return jsonResponse(400, map[string]any{"error": "invalid query contract"}), nil
+			}
+			s.accountID = call.Header["Chatgpt-Account-Id"]
+		case "antigravity":
+			// Official endpoints from the management UI; the body must target the
+			// project the host exposes for this auth.
+			project, _ := json.Marshal(map[string]any{"project": selected["project_id"]})
+			official := map[string]bool{
+				"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary":         true,
+				"https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary": true,
+				"https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary":               true,
+			}
+			if call.Method != "POST" || !official[call.URL] || call.Header["User-Agent"] != "antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)" || call.Data != string(project) {
+				return jsonResponse(400, map[string]any{"error": "invalid query contract"}), nil
+			}
+		default:
+			return jsonResponse(400, map[string]any{"error": "invalid query contract"}), nil
+		}
+		s.selectedProxy, _ = selected["proxy_url"].(string)
+		s.queryURLs[call.AuthIndex] = append(s.queryURLs[call.AuthIndex], call.URL)
 		index := s.queryCount[call.AuthIndex]
 		s.queryCount[call.AuthIndex]++
 		if s.disableOnQuery {

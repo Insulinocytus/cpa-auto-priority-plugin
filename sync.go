@@ -82,7 +82,10 @@ type authFile struct {
 	Source      string `json:"source"`
 	Path        string `json:"path"`
 	RuntimeOnly *bool  `json:"runtime_only"`
-	IDToken     struct {
+	// The host exposes the project its Antigravity executor uses
+	// (metadata.project_id); no raw auth JSON is downloaded for it.
+	ProjectID string `json:"project_id"`
+	IDToken   struct {
 		AccountID string `json:"chatgpt_account_id"`
 	} `json:"id_token"`
 }
@@ -120,6 +123,64 @@ func (s *Synchronizer) request(ctx context.Context, method, path string, body an
 		return &managementHTTPError{response.StatusCode}
 	}
 	return nil
+}
+
+type apiCall struct {
+	AuthIndex string            `json:"auth_index"`
+	Method    string            `json:"method"`
+	URL       string            `json:"url"`
+	Header    map[string]string `json:"header"`
+	Data      string            `json:"data,omitempty"`
+}
+
+// upstream runs one quota request through the host, which substitutes
+// $TOKEN$ and keeps the selected auth's proxy. It returns the JSON object body.
+func (s *Synchronizer) upstream(ctx context.Context, call apiCall) ([]byte, string) {
+	var response struct {
+		Status int    `json:"status_code"`
+		Body   string `json:"body"`
+	}
+	if err := s.request(ctx, "POST", "requests/api-call", call, &response); err != nil {
+		return nil, err.Error()
+	}
+	if response.Status == 401 {
+		return nil, "credentials_invalid"
+	}
+	if response.Status < 200 || response.Status >= 300 {
+		return nil, "upstream_http_failed"
+	}
+	payload := bytes.TrimSpace([]byte(response.Body))
+	if len(payload) == 0 || payload[0] != '{' {
+		return nil, "quota_response_malformed"
+	}
+	return payload, "ok"
+}
+
+// quotaPeriods holds one natural reset time per quota period, in seconds.
+type quotaPeriods map[int64]time.Time
+
+// add reports false for a second, different reset in the same period: no
+// upstream contract says which same-period constraint is representative.
+func (p quotaPeriods) add(seconds int64, reset time.Time) bool {
+	if previous, exists := p[seconds]; exists && !reset.Equal(previous) {
+		return false
+	}
+	p[seconds] = reset
+	return true
+}
+
+// sequence orders reset times from the longest period to the shortest.
+func (p quotaPeriods) sequence() []time.Time {
+	durations := make([]int64, 0, len(p))
+	for duration := range p {
+		durations = append(durations, duration)
+	}
+	sort.Slice(durations, func(i, j int) bool { return durations[i] > durations[j] })
+	sequence := make([]time.Time, 0, len(durations))
+	for _, duration := range durations {
+		sequence = append(sequence, p[duration])
+	}
+	return sequence
 }
 
 // The host removes capabilities on disable without notifying the library.
@@ -220,16 +281,24 @@ func (s *Synchronizer) Sync(ctx context.Context) (Round, error) {
 	groups := make(map[string][]int)
 	for i, file := range files {
 		result := Result{Name: file.Name, Provider: file.Provider, Priority: -1, QueryStatus: "unsupported_provider", WriteStatus: "not_attempted", Persistence: "unverified"}
-		if file.Provider == "codex" {
+		var query func(context.Context, authFile, int) ([]time.Time, string)
+		switch file.Provider {
+		case "codex":
+			query = s.codex
+		case "antigravity":
+			query = s.antigravity
+		}
+		if query != nil {
 			result.QueryStatus = "missing_auth_index"
 			if file.Index != "" {
-				for range 2 {
-					sequences[i], result.QueryStatus = s.codex(ctx, file)
+				for attempt := range 2 {
+					sequences[i], result.QueryStatus = query(ctx, file, attempt)
 					if result.QueryStatus == ErrManagementAuthentication.Error() {
 						round.Results = append(round.Results, result)
 						return round, ErrManagementAuthentication
 					}
-					if result.QueryStatus == "ok" || result.QueryStatus == "no_reset_time" || result.QueryStatus == "credentials_invalid" || ctx.Err() != nil {
+					// Only failed requests retry; settled answers and absent prerequisites do not.
+					if result.QueryStatus == "ok" || result.QueryStatus == "no_reset_time" || result.QueryStatus == "credentials_invalid" || result.QueryStatus == "missing_project_id" || ctx.Err() != nil {
 						break
 					}
 				}
