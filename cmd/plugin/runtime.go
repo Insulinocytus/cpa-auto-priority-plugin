@@ -88,9 +88,9 @@ func (p *pluginRuntime) startup(ctx context.Context, done chan struct{}, syncer 
 			p.setStatus(status{Phase: round.Status, Round: &round})
 			return
 		}
-		// Readiness polling is not a provider/write retry. Once a round has
-		// produced auth results, never rerun it automatically after an error.
-		if len(round.Results) > 0 {
+		// Authentication retries can ban the shared management client IP.
+		// Once a round has auth results, never rerun it automatically either.
+		if errors.Is(err, priority.ErrManagementAuthentication) || len(round.Results) > 0 {
 			p.setStatus(status{Phase: "failed", Error: err.Error(), Round: &round})
 			return
 		}

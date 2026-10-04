@@ -17,6 +17,9 @@ import (
 
 const PluginID = "cpa-auto-priority"
 
+// ErrManagementAuthentication stops a round on management HTTP 401/403.
+var ErrManagementAuthentication = errors.New("management_authentication_failed")
+
 // Config uses an explicit management origin and its plaintext management key.
 // The key is never included in observable errors or results.
 type Config struct {
@@ -104,6 +107,9 @@ func (s *Synchronizer) request(ctx context.Context, method, path string, body an
 		return errors.New("management_transport_failed")
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusUnauthorized || response.StatusCode == http.StatusForbidden {
+		return ErrManagementAuthentication
+	}
 	if out != nil {
 		data, err := io.ReadAll(io.LimitReader(response.Body, 2*1024*1024+1))
 		if err != nil || len(data) > 2*1024*1024 || json.Unmarshal(data, out) != nil {
@@ -146,6 +152,9 @@ func (s *Synchronizer) physical(ctx context.Context, name string) (bool, error) 
 	err := s.request(ctx, "PATCH", "credentials/fields", struct {
 		Name string `json:"name"`
 	}{name}, &response)
+	if errors.Is(err, ErrManagementAuthentication) {
+		return false, err
+	}
 	var httpErr *managementHTTPError
 	if errors.As(err, &httpErr) {
 		if httpErr.status == 409 && response.Error == "plugin virtual auth cannot be modified directly; edit or delete the source auth file" {
@@ -216,6 +225,10 @@ func (s *Synchronizer) Sync(ctx context.Context) (Round, error) {
 			if file.Index != "" {
 				for range 2 {
 					sequences[i], result.QueryStatus = s.codex(ctx, file)
+					if result.QueryStatus == ErrManagementAuthentication.Error() {
+						round.Results = append(round.Results, result)
+						return round, ErrManagementAuthentication
+					}
 					if result.QueryStatus == "ok" || result.QueryStatus == "no_reset_time" || result.QueryStatus == "credentials_invalid" || ctx.Err() != nil {
 						break
 					}
@@ -256,9 +269,13 @@ func (s *Synchronizer) Sync(ctx context.Context) (Round, error) {
 		var response struct {
 			Status string `json:"status"`
 		}
-		if s.request(ctx, "PATCH", "credentials/fields", patch, &response) != nil || response.Status != "ok" {
+		err := s.request(ctx, "PATCH", "credentials/fields", patch, &response)
+		if err != nil || response.Status != "ok" {
 			result.WriteStatus = "failed"
 			round.Status = "write_failed"
+			if errors.Is(err, ErrManagementAuthentication) {
+				return round, err
+			}
 		} else {
 			result.WriteStatus = "acknowledged"
 		}
