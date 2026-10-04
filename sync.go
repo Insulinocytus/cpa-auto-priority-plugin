@@ -137,7 +137,7 @@ type apiCall struct {
 }
 
 // upstream runs one quota request through the host, which substitutes
-// $TOKEN$ and keeps the selected auth's proxy. It returns the JSON object body.
+// $TOKEN$ and keeps the selected auth's proxy. Providers validate the body.
 func (s *Synchronizer) upstream(ctx context.Context, call apiCall) ([]byte, string) {
 	var response struct {
 		Status int    `json:"status_code"`
@@ -152,11 +152,7 @@ func (s *Synchronizer) upstream(ctx context.Context, call apiCall) ([]byte, stri
 	if response.Status < 200 || response.Status >= 300 {
 		return nil, "upstream_http_failed"
 	}
-	payload := bytes.TrimSpace([]byte(response.Body))
-	if len(payload) == 0 || payload[0] != '{' {
-		return nil, "quota_response_malformed"
-	}
-	return payload, "ok"
+	return []byte(response.Body), "ok"
 }
 
 // quotaPeriods holds one natural reset time per quota period, in seconds.
@@ -170,20 +166,6 @@ func (p quotaPeriods) add(seconds int64, reset time.Time) bool {
 	}
 	p[seconds] = reset
 	return true
-}
-
-// sequence orders reset times from the longest period to the shortest.
-func (p quotaPeriods) sequence() []time.Time {
-	durations := make([]int64, 0, len(p))
-	for duration := range p {
-		durations = append(durations, duration)
-	}
-	sort.Slice(durations, func(i, j int) bool { return durations[i] > durations[j] })
-	sequence := make([]time.Time, 0, len(durations))
-	for _, duration := range durations {
-		sequence = append(sequence, p[duration])
-	}
-	return sequence
 }
 
 // The host removes capabilities on disable without notifying the library.
@@ -258,6 +240,10 @@ func (s *Synchronizer) Sync(ctx context.Context) (Round, error) {
 	}
 	files := make([]authFile, 0, len(*snapshot.Files))
 	ids := make(map[string]bool)
+	names := make(map[string]int, len(*snapshot.Files))
+	for _, file := range *snapshot.Files {
+		names[file.Name]++
+	}
 	for _, file := range *snapshot.Files {
 		if file.RuntimeOnly == nil || *file.RuntimeOnly || file.Source != "file" || file.Path == "" {
 			continue
@@ -284,31 +270,26 @@ func (s *Synchronizer) Sync(ctx context.Context) (Round, error) {
 	groups := make(map[string][]int)
 	for i, file := range files {
 		result := Result{Name: file.Name, Provider: file.Provider, Priority: -1, QueryStatus: "unsupported_provider", WriteStatus: "not_attempted", Persistence: "unverified"}
-		var query func(context.Context, authFile, int) ([]time.Time, string)
-		switch file.Provider {
-		case "codex":
-			query = s.codex
-		case "antigravity":
-			query = s.antigravity
-		}
-		if query != nil {
-			result.QueryStatus = "missing_auth_index"
-			if file.Index != "" {
-				for attempt := range queryAttempts {
-					sequences[i], result.QueryStatus = query(ctx, file, attempt)
-					if result.QueryStatus == ErrManagementAuthentication.Error() {
-						round.Results = append(round.Results, result)
-						return round, ErrManagementAuthentication
-					}
-					// Only failed requests retry; settled answers and absent prerequisites do not.
-					if result.QueryStatus == "ok" || result.QueryStatus == "no_reset_time" || result.QueryStatus == "credentials_invalid" || result.QueryStatus == "missing_project_id" || ctx.Err() != nil {
-						break
-					}
-				}
+		query, status := s.quotaQuery(ctx, file, names[file.Name] == 1)
+		result.QueryStatus = status
+		for attempt := 0; query != nil && attempt < queryAttempts; attempt++ {
+			sequences[i], result.QueryStatus = query()
+			// Codex retries usage and cards separately; never replay its whole query.
+			if file.Provider == "codex" || !retryQuery(ctx, result.QueryStatus) {
+				break
 			}
 		}
+		if result.QueryStatus == ErrManagementAuthentication.Error() {
+			round.Results = append(round.Results, result)
+			return round, ErrManagementAuthentication
+		}
 		if len(sequences[i]) > 0 {
-			groups[file.Provider] = append(groups[file.Provider], i)
+			// Pinned host executorKeyFromAuth schedules these aliases together.
+			group := map[string]string{"kimi.com": "kimi", "kimi.ai": "kimi-ai"}[file.Provider]
+			if group == "" {
+				group = file.Provider
+			}
+			groups[group] = append(groups[group], i)
 		}
 		round.Results = append(round.Results, result)
 	}
@@ -372,4 +353,57 @@ func compare(a, b []time.Time) int {
 		return 1
 	}
 	return 0
+}
+
+// quotaQuery resolves provider prerequisites once; only upstream queries are
+// retried. Codex owns its per-request retries. A nil query leaves auth unsortable.
+func (s *Synchronizer) quotaQuery(ctx context.Context, file authFile, uniqueName bool) (func() ([]time.Time, string), string) {
+	if file.Provider != "codex" && file.Provider != "antigravity" && file.Provider != "xai" && !isKimi(file.Provider) {
+		return nil, "unsupported_provider"
+	}
+	if file.Index == "" {
+		return nil, "missing_auth_index"
+	}
+	if file.Provider == "codex" {
+		return func() ([]time.Time, string) { return s.codex(ctx, file) }, "ok"
+	}
+	if file.Provider == "antigravity" {
+		if strings.TrimSpace(file.ProjectID) == "" {
+			return nil, "missing_project_id"
+		}
+		attempt := 0
+		return func() ([]time.Time, string) {
+			sequence, status := s.antigravity(ctx, file, attempt)
+			attempt++
+			return sequence, status
+		}, "ok"
+	}
+	// Metadata download is by filename; never guess between duplicate names.
+	if !uniqueName {
+		return nil, "auth_metadata_ambiguous"
+	}
+	metadata, status := s.quotaMetadata(ctx, file)
+	if status != "ok" {
+		return nil, status
+	}
+	if isKimi(file.Provider) {
+		endpoint, status := kimiURL(metadata, file)
+		if status != "ok" {
+			return nil, status
+		}
+		return func() ([]time.Time, string) { return s.kimi(ctx, file, endpoint) }, "ok"
+	}
+	headers, status := xaiHeaders(metadata)
+	if status != "ok" {
+		return nil, status
+	}
+	return func() ([]time.Time, string) { return s.xai(ctx, file, headers) }, "ok"
+}
+
+// Provider parsing establishes validity and scope; this shared synchronization
+// rule only lowers an existing period's sorting time, never creates a window.
+func applyCardExpiry(periods map[int64]time.Time, duration int64, expiry time.Time) {
+	if reset, exists := periods[duration]; exists && !expiry.IsZero() && expiry.Before(reset) {
+		periods[duration] = expiry
+	}
 }

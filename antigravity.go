@@ -94,5 +94,5 @@ func (s *Synchronizer) antigravity(ctx context.Context, file authFile, attempt i
 	if len(periods) == 0 {
 		return nil, "no_reset_time"
 	}
-	return periods.sequence(), "ok"
+	return periodSequence(periods), "ok"
 }
