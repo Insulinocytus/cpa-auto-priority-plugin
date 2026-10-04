@@ -20,6 +20,9 @@ const PluginID = "cpa-auto-priority"
 // ErrManagementAuthentication stops a round on management HTTP 401/403.
 var ErrManagementAuthentication = errors.New("management_authentication_failed")
 
+// ErrPluginNotEnabled prevents work after the host removes this registration.
+var ErrPluginNotEnabled = errors.New("plugin_not_enabled")
+
 // Config uses an explicit management origin and its plaintext management key.
 // The key is never included in observable errors or results.
 type Config struct {
@@ -141,9 +144,9 @@ func (p quotaPeriods) add(seconds int64, reset time.Time) bool {
 	return true
 }
 
+// CheckEnabled verifies the host's effective registration without reading auth.
 // The host removes capabilities on disable without notifying the library.
-// Check its effective registration before work and before each narrow write.
-func (s *Synchronizer) enabled(ctx context.Context) error {
+func (s *Synchronizer) CheckEnabled(ctx context.Context) error {
 	var listing struct {
 		Plugins []struct {
 			ID      string `json:"id"`
@@ -158,7 +161,7 @@ func (s *Synchronizer) enabled(ctx context.Context) error {
 			return nil
 		}
 	}
-	return errors.New("plugin_not_enabled")
+	return ErrPluginNotEnabled
 }
 
 // Pinned fields validation rejects virtual auth before checking for absent
@@ -193,7 +196,7 @@ func (s *Synchronizer) Sync(ctx context.Context) (Round, error) {
 	if ctx.Err() != nil {
 		return round, errors.New("sync_cancelled")
 	}
-	if err := s.enabled(ctx); err != nil {
+	if err := s.CheckEnabled(ctx); err != nil {
 		return round, err
 	}
 	var snapshot struct {
@@ -276,7 +279,7 @@ func (s *Synchronizer) Sync(ctx context.Context) (Round, error) {
 			round.Status = "cancelled"
 			return round, errors.New("sync_cancelled")
 		}
-		if err := s.enabled(ctx); err != nil {
+		if err := s.CheckEnabled(ctx); err != nil {
 			round.Status = "not_enabled"
 			return round, err
 		}

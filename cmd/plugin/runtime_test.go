@@ -28,18 +28,6 @@ func lifecycle(config string) []byte {
 
 const validConfig = "enabled: true\npriority: 1\nmanagement_url: http://127.0.0.1:8317\nmanagement_key: explicit-secret\n"
 
-func waitDone(t *testing.T, p *pluginRuntime) {
-	t.Helper()
-	p.lifecycle.Lock()
-	done := p.done
-	p.lifecycle.Unlock()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("startup failed to complete")
-	}
-}
-
 func TestStartupReconfigureOnceAndAuthenticatedStatus(t *testing.T) {
 	var mu sync.Mutex
 	writes := 0
@@ -82,7 +70,7 @@ func TestStartupReconfigureOnceAndAuthenticatedStatus(t *testing.T) {
 			return response(500, `{}`), nil
 		}
 	})}
-	p := newRuntime(client)
+	p, clock := newTestRuntime(client)
 	defer p.stop()
 	registered := p.handle("plugin.register", lifecycle(validConfig))
 	var registrationEnvelope struct {
@@ -98,7 +86,7 @@ func TestStartupReconfigureOnceAndAuthenticatedStatus(t *testing.T) {
 	if json.Unmarshal(registered, &registrationEnvelope) != nil || !registrationEnvelope.OK || registrationEnvelope.Result.SchemaVersion != 6 || registrationEnvelope.Result.Metadata.Name != priority.PluginID || !registrationEnvelope.Result.Capabilities.Management {
 		t.Fatalf("invalid registration: %s", registered)
 	}
-	waitDone(t, p)
+	clock.Await(t)
 	if err := p.configure(lifecycle(validConfig)); err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +134,7 @@ func TestStartupManagementAuthenticationFailureStopsAndReconfigureRecovers(t *te
 		t.Run(tc.name, func(t *testing.T) {
 			failures := 0
 			retried := make(chan struct{})
-			p := newRuntime(&http.Client{Transport: transportFunc(func(r *http.Request) (*http.Response, error) {
+			p, clock := newTestRuntime(&http.Client{Transport: transportFunc(func(r *http.Request) (*http.Response, error) {
 				if r.Header.Get("Authorization") == "Bearer corrected-secret" {
 					if r.URL.Path == "/v8/management/plugins" {
 						return response(200, `{"plugins":[{"id":"cpa-auto-priority","effective_enabled":true}]}`), nil
@@ -212,7 +200,7 @@ func TestStartupManagementAuthenticationFailureStopsAndReconfigureRecovers(t *te
 			if err := p.configure(lifecycle(corrected)); err != nil {
 				t.Fatal(err)
 			}
-			waitDone(t, p)
+			clock.Await(t)
 			if state := p.getStatus(); state.Phase != "empty" {
 				t.Fatalf("corrected management key did not recover startup: %+v", state)
 			}
@@ -263,7 +251,7 @@ func TestInvalidReconfigurationPreservesRunningGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-entered
-	for _, config := range []string{"enabled: [\"explicit-secret\"]", validConfig + "cron: garbage\n", "enabled: true\nmanagement_url: http://remote.example\nmanagement_key: explicit-secret\n"} {
+	for _, config := range []string{"enabled: [\"explicit-secret\"]", validConfig + "cron: garbage\n", validConfig + "timezone: invalid/location\n", "enabled: true\nmanagement_url: http://remote.example\nmanagement_key: explicit-secret\n"} {
 		if err := p.configure(lifecycle(config)); err == nil || bytes.Contains([]byte(err.Error()), []byte("explicit-secret")) {
 			t.Fatalf("unsafe validation: %v", err)
 		}

@@ -6,18 +6,23 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
+	_ "time/tzdata"
 
 	priority "github.com/Insulinocytus/cpa-auto-priority-plugin"
+	"github.com/robfig/cron/v3"
 	"gopkg.in/yaml.v3"
 )
 
 const statusPath = "/auto-priority/status"
 
 type pluginConfig struct {
-	Enabled         bool `yaml:"enabled"`
-	Priority        int  `yaml:"priority"`
+	Enabled         bool   `yaml:"enabled"`
+	Priority        int    `yaml:"priority"`
+	Cron            string `yaml:"cron"`
+	Timezone        string `yaml:"timezone"`
 	priority.Config `yaml:",inline"`
 }
 
@@ -35,10 +40,23 @@ type pluginRuntime struct {
 	done      chan struct{}
 	state     status
 	client    *http.Client
+	now       func() time.Time
+	wait      func(context.Context, time.Duration) bool
 }
 
 func newRuntime(client *http.Client) *pluginRuntime {
-	return &pluginRuntime{client: client, state: status{Phase: "not_configured"}}
+	return &pluginRuntime{client: client, now: time.Now, wait: waitFor, state: status{Phase: "not_configured"}}
+}
+
+func waitFor(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return ctx.Err() == nil
+	}
 }
 
 func (p *pluginRuntime) configure(raw []byte) error {
@@ -54,14 +72,40 @@ func (p *pluginRuntime) configure(raw []byte) error {
 	if decoder.Decode(&config) != nil {
 		return errors.New("invalid_plugin_config")
 	}
-	syncer, err := priority.New(config.Config, p.client, nil)
+	schedule, err := parseSchedule(config.Cron, config.Timezone, p.now())
+	if err != nil {
+		return err
+	}
+	syncer, err := priority.New(config.Config, p.client, p.now)
 	if err != nil {
 		return err
 	}
 	p.lifecycle.Lock()
 	defer p.lifecycle.Unlock()
 	if p.cancel != nil && config == p.config {
-		return nil
+		select {
+		case <-p.done:
+			// Management 401/403 still needs a changed key to avoid an IP ban.
+			if p.getStatus().Error == priority.ErrManagementAuthentication.Error() {
+				return nil
+			}
+		default:
+			state := p.getStatus()
+			if state.Phase == "starting" || state.Phase == "waiting" || state.Error == priority.ErrManagementAuthentication.Error() {
+				return nil
+			}
+			// Re-enable RPC precedes host publication. An in-flight disabled
+			// round may still be exiting; cancel and join it before replacing it.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err := syncer.CheckEnabled(ctx)
+			cancel()
+			if err == nil {
+				return nil
+			}
+			if !errors.Is(err, priority.ErrPluginNotEnabled) {
+				return err
+			}
+		}
 	}
 	p.stopLocked()
 	p.config = config
@@ -73,34 +117,83 @@ func (p *pluginRuntime) configure(raw []byte) error {
 	p.cancel = cancel
 	p.done = make(chan struct{})
 	p.setStatus(status{Phase: "starting"})
-	go p.startup(ctx, p.done, syncer)
+	go p.run(ctx, p.done, syncer, schedule)
 	return nil
 }
 
-func (p *pluginRuntime) startup(ctx context.Context, done chan struct{}, syncer *priority.Synchronizer) {
+// parseSchedule rejects syntax robfig accepts outside standard crontab:
+// question marks, embedded timezones, and empty list items it would drop.
+func parseSchedule(expression, timezone string, now time.Time) (*cron.SpecSchedule, error) {
+	if expression == "" {
+		expression = "0 0 * * *"
+	}
+	fields := strings.Fields(expression)
+	if len(fields) != 5 || strings.Contains(expression, "?") {
+		return nil, errors.New("invalid_cron: expected standard five fields")
+	}
+	if strings.HasPrefix(fields[0], "TZ=") || strings.HasPrefix(fields[0], "CRON_TZ=") {
+		return nil, errors.New("invalid_cron: use timezone configuration")
+	}
+	for _, field := range fields {
+		if strings.HasPrefix(field, ",") || strings.HasSuffix(field, ",") || strings.Contains(field, ",,") {
+			return nil, errors.New("invalid_cron: empty list item")
+		}
+	}
+	parsed, err := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow).Parse(expression)
+	if err != nil {
+		return nil, errors.New("invalid_cron: invalid field value")
+	}
+	location := time.Local
+	if timezone != "" {
+		location, err = time.LoadLocation(timezone)
+		if err != nil {
+			return nil, errors.New("invalid_timezone")
+		}
+	}
+	schedule := parsed.(*cron.SpecSchedule)
+	schedule.Location = location
+	if schedule.Next(now.In(location)).IsZero() {
+		return nil, errors.New("invalid_cron: no calendar occurrence")
+	}
+	return schedule, nil
+}
+
+func (p *pluginRuntime) run(ctx context.Context, done chan struct{}, syncer *priority.Synchronizer, schedule *cron.SpecSchedule) {
 	defer close(done)
+	hostReady := false
 	for {
 		round, err := syncer.Sync(ctx)
 		if ctx.Err() != nil {
 			return
 		}
+		if err != nil && !hostReady && len(round.Results) == 0 && !errors.Is(err, priority.ErrManagementAuthentication) {
+			p.setStatus(status{Phase: "waiting", Error: err.Error()})
+			if !p.wait(ctx, time.Second) {
+				return
+			}
+			continue
+		}
 		if err == nil {
 			p.setStatus(status{Phase: round.Status, Round: &round})
-			return
-		}
-		// Authentication retries can ban the shared management client IP.
-		// Once a round has auth results, never rerun it automatically either.
-		if errors.Is(err, priority.ErrManagementAuthentication) || len(round.Results) > 0 {
+		} else {
 			p.setStatus(status{Phase: "failed", Error: err.Error(), Round: &round})
+			// Management auth retries can ban the shared client IP. Disable
+			// is not a reason to retain a periodic background worker either.
+			if errors.Is(err, priority.ErrManagementAuthentication) || errors.Is(err, priority.ErrPluginNotEnabled) {
+				return
+			}
+		}
+		hostReady = true
+		// One worker owns both triggers and Sync. Missed occurrences during
+		// a long round are skipped, never queued or replayed.
+		now := p.now().In(schedule.Location)
+		next := schedule.Next(now)
+		if next.IsZero() {
+			p.setStatus(status{Phase: "failed", Error: "invalid_cron: no calendar occurrence"})
 			return
 		}
-		p.setStatus(status{Phase: "waiting", Error: err.Error()})
-		timer := time.NewTimer(time.Second)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+		if !p.wait(ctx, next.Sub(now)) {
 			return
-		case <-timer.C:
 		}
 	}
 }
@@ -162,7 +255,7 @@ func (p *pluginRuntime) handle(method string, raw []byte) []byte {
 		p.stop()
 		return rpcSuccess(struct{}{})
 	case "management.register":
-		return rpcSuccess(map[string]any{"routes": []any{map[string]any{"Method": "GET", "Path": statusPath, "Description": "Last startup priority sync; persistence is unverified."}}})
+		return rpcSuccess(map[string]any{"routes": []any{map[string]any{"Method": "GET", "Path": statusPath, "Description": "Last priority sync; persistence is unverified."}}})
 	case "management.handle":
 		var request struct {
 			Method string
@@ -199,6 +292,8 @@ func registration() any {
 			"ConfigFields": []any{
 				map[string]string{"Name": "management_url", "Type": "string", "Description": "This host's management origin; HTTPS is required off loopback."},
 				map[string]string{"Name": "management_key", "Type": "string", "Description": "Explicit management key; protect the host configuration file."},
+				map[string]string{"Name": "cron", "Type": "string", "Description": "Standard five-field cron; default 0 0 * * * (calendar midnight)."},
+				map[string]string{"Name": "timezone", "Type": "string", "Description": "IANA timezone override; default host system timezone."},
 			},
 		},
 		"capabilities": map[string]bool{"management_api": true},
