@@ -17,6 +17,8 @@ func TestInvalidSchedulesDoNotStartHostWork(t *testing.T) {
 		"cron: '0 0 0 * * *'\n",
 		"cron: '@daily'\n",
 		"cron: 'CRON_TZ=UTC 0 0 * * *'\n",
+		"cron: 'TZ=UTC\t0\t0\t*\t*'\n",
+		"cron: 'CRON_TZ=UTC\t0\t0\t*\t*'\n",
 		"cron: '60 0 * * *'\n",
 		"cron: '*/0 * * * *'\n",
 		"cron: '0 0 30 2 *'\n",

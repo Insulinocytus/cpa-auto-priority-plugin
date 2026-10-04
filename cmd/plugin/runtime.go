@@ -131,6 +131,9 @@ func parseSchedule(expression, timezone string, now time.Time) (*cron.SpecSchedu
 	if len(fields) != 5 || strings.Contains(expression, "?") {
 		return nil, errors.New("invalid_cron: expected standard five fields")
 	}
+	if strings.HasPrefix(fields[0], "TZ=") || strings.HasPrefix(fields[0], "CRON_TZ=") {
+		return nil, errors.New("invalid_cron: use timezone configuration")
+	}
 	for _, field := range fields {
 		if strings.HasPrefix(field, ",") || strings.HasSuffix(field, ",") || strings.Contains(field, ",,") {
 			return nil, errors.New("invalid_cron: empty list item")
