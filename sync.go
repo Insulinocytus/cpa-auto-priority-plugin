@@ -125,6 +125,9 @@ func (s *Synchronizer) request(ctx context.Context, method, path string, body an
 	return nil
 }
 
+// A failed required quota query is retried once: two requests at most.
+const queryAttempts = 2
+
 type apiCall struct {
 	AuthIndex string            `json:"auth_index"`
 	Method    string            `json:"method"`
@@ -291,7 +294,7 @@ func (s *Synchronizer) Sync(ctx context.Context) (Round, error) {
 		if query != nil {
 			result.QueryStatus = "missing_auth_index"
 			if file.Index != "" {
-				for attempt := range 2 {
+				for attempt := range queryAttempts {
 					sequences[i], result.QueryStatus = query(ctx, file, attempt)
 					if result.QueryStatus == ErrManagementAuthentication.Error() {
 						round.Results = append(round.Results, result)

@@ -10,7 +10,7 @@ import (
 // The official management UI tries these in order within one fetch (a third,
 // production URL follows). Each attempt here is one request, so the two-attempt
 // budget covers only the first two; no further fallback is stacked on top.
-var antigravityQuotaURLs = [2]string{
+var antigravityQuotaURLs = [queryAttempts]string{
 	"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary",
 	"https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary",
 }
@@ -49,18 +49,27 @@ func (s *Synchronizer) antigravity(ctx context.Context, file authFile, attempt i
 		return nil, "quota_response_malformed"
 	}
 	// Groups are model families sharing account periods. Equal resets in one
-	// period merge; differing ones have no verified representative.
+	// period merge; differing ones, or a family with no reset where another has
+	// one, have no verified representative.
 	periods := quotaPeriods{}
+	untimed := map[int64]bool{}
+	buckets := 0
 	for _, group := range *summary.Groups {
 		for _, bucket := range group.Buckets {
+			buckets++
+			// Official UI: resetTime ?? reset_time, so only absence falls back.
 			raw := bucket.ResetTime
-			if absentReset(raw) {
+			if len(raw) == 0 || isNull(raw) {
 				raw = bucket.ResetSnake
 			}
-			if absentReset(raw) {
+			period, known := antigravityPeriods[strings.ToLower(strings.TrimSpace(bucket.Window))]
+			var text string
+			if len(raw) == 0 || isNull(raw) || (json.Unmarshal(raw, &text) == nil && strings.TrimSpace(text) == "") {
+				if known {
+					untimed[period] = true
+				}
 				continue
 			}
-			period, known := antigravityPeriods[strings.ToLower(strings.TrimSpace(bucket.Window))]
 			if !known {
 				return nil, "quota_period_unverified"
 			}
@@ -73,13 +82,17 @@ func (s *Synchronizer) antigravity(ctx context.Context, file authFile, attempt i
 			}
 		}
 	}
+	if buckets == 0 {
+		// The official UI moves on to its next endpoint for an empty summary.
+		return nil, "no_quota_groups"
+	}
+	for period := range untimed {
+		if _, timed := periods[period]; timed {
+			return nil, "quota_period_ambiguous"
+		}
+	}
 	if len(periods) == 0 {
 		return nil, "no_reset_time"
 	}
 	return periods.sequence(), "ok"
-}
-
-func absentReset(raw json.RawMessage) bool {
-	var text string
-	return len(raw) == 0 || isNull(raw) || (json.Unmarshal(raw, &text) == nil && strings.TrimSpace(text) == "")
 }

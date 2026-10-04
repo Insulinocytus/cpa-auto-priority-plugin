@@ -98,11 +98,7 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 			// Official endpoints from the management UI; the body must target the
 			// project the host exposes for this auth.
 			project, _ := json.Marshal(map[string]any{"project": selected["project_id"]})
-			official := map[string]bool{
-				"https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary":         true,
-				"https://daily-cloudcode-pa.sandbox.googleapis.com/v1internal:retrieveUserQuotaSummary": true,
-				"https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary":               true,
-			}
+			official := map[string]bool{dailyQuotaURL: true, sandboxQuotaURL: true, "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary": true}
 			if call.Method != "POST" || !official[call.URL] || call.Header["User-Agent"] != "antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)" || call.Data != string(project) {
 				return jsonResponse(400, map[string]any{"error": "invalid query contract"}), nil
 			}

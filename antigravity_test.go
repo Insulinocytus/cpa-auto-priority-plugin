@@ -79,7 +79,7 @@ func TestSyncAntigravityGroupWindowsMergeAndProviderIsolation(t *testing.T) {
 	}
 }
 
-func TestSyncAntigravityRetryEndpointsAndUnrankableData(t *testing.T) {
+func TestSyncAntigravityRetryEndpointsAndUnrankableAuthFiles(t *testing.T) {
 	valid := `{"groups":[{"displayName":"Gemini Models","buckets":[{"window":"weekly","resetTime":"2026-10-08T00:00:00Z"}]}]}`
 	for _, tc := range []struct {
 		name      string
@@ -96,8 +96,11 @@ func TestSyncAntigravityRetryEndpointsAndUnrankableData(t *testing.T) {
 		{"invalid-credentials", []string{`{"error":"secret"}`}, 401, -1, []string{dailyQuotaURL}, "credentials_invalid"},
 		{"unverified-window", []string{`{"groups":[{"buckets":[{"window":"daily","resetTime":"2026-10-05T00:00:00Z"},{"window":"weekly","resetTime":"2026-10-08T00:00:00Z"}]}]}`}, 200, -1, []string{dailyQuotaURL, sandboxQuotaURL}, "quota_period_unverified"},
 		{"missing-window", []string{`{"groups":[{"buckets":[{"resetTime":"2026-10-05T00:00:00Z"}]}]}`}, 200, -1, []string{dailyQuotaURL, sandboxQuotaURL}, "quota_period_unverified"},
-		{"empty-groups", []string{`{"groups":[]}`}, 200, -1, []string{dailyQuotaURL}, "no_reset_time"},
+		{"empty-groups-try-next-endpoint", []string{`{"groups":[]}`, valid}, 200, 0, []string{dailyQuotaURL, sandboxQuotaURL}, "ok"},
+		{"empty-groups-twice", []string{`{"groups":[{"displayName":"Gemini Models","buckets":[]}]}`}, 200, -1, []string{dailyQuotaURL, sandboxQuotaURL}, "no_quota_groups"},
 		{"no-reset-times", []string{`{"groups":[{"buckets":[{"window":"weekly","remainingFraction":1,"resetTime":""},{"window":"daily","remainingFraction":1}]}],"subscriptionEndTime":"2026-10-05T00:00:00Z"}`}, 200, -1, []string{dailyQuotaURL}, "no_reset_time"},
+		{"empty-camel-reset-does-not-fall-back", []string{`{"groups":[{"buckets":[{"window":"weekly","resetTime":"","reset_time":"2026-10-08T00:00:00Z"}]}]}`}, 200, -1, []string{dailyQuotaURL}, "no_reset_time"},
+		{"untimed-family-beside-timed-family", []string{`{"groups":[{"displayName":"Gemini Models","buckets":[{"window":"weekly","resetTime":"2026-10-08T00:00:00Z"}]},{"displayName":"Claude and GPT Models","buckets":[{"window":"weekly","remainingFraction":1}]}]}`}, 200, -1, []string{dailyQuotaURL, sandboxQuotaURL}, "quota_period_ambiguous"},
 		{"unix-reset", []string{`{"groups":[{"buckets":[{"window":"weekly","resetTime":1791417600}]}]}`}, 200, 0, []string{dailyQuotaURL}, "ok"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
