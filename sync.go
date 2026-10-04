@@ -85,7 +85,10 @@ type authFile struct {
 	Source      string `json:"source"`
 	Path        string `json:"path"`
 	RuntimeOnly *bool  `json:"runtime_only"`
-	IDToken     struct {
+	// The host exposes the project its Antigravity executor uses
+	// (metadata.project_id); no raw auth JSON is downloaded for it.
+	ProjectID string `json:"project_id"`
+	IDToken   struct {
 		AccountID string `json:"chatgpt_account_id"`
 	} `json:"id_token"`
 }
@@ -123,6 +126,49 @@ func (s *Synchronizer) request(ctx context.Context, method, path string, body an
 		return &managementHTTPError{response.StatusCode}
 	}
 	return nil
+}
+
+// A failed required quota query is retried once: two requests at most.
+const queryAttempts = 2
+
+type apiCall struct {
+	AuthIndex string            `json:"auth_index"`
+	Method    string            `json:"method"`
+	URL       string            `json:"url"`
+	Header    map[string]string `json:"header"`
+	Data      string            `json:"data,omitempty"`
+}
+
+// upstream runs one quota request through the host, which substitutes
+// $TOKEN$ and keeps the selected auth's proxy. Providers validate the body.
+func (s *Synchronizer) upstream(ctx context.Context, call apiCall) ([]byte, string) {
+	var response struct {
+		Status int    `json:"status_code"`
+		Body   string `json:"body"`
+	}
+	if err := s.request(ctx, "POST", "requests/api-call", call, &response); err != nil {
+		return nil, err.Error()
+	}
+	if response.Status == 401 {
+		return nil, "credentials_invalid"
+	}
+	if response.Status < 200 || response.Status >= 300 {
+		return nil, "upstream_http_failed"
+	}
+	return []byte(response.Body), "ok"
+}
+
+// quotaPeriods holds one natural reset time per quota period, in seconds.
+type quotaPeriods map[int64]time.Time
+
+// add reports false for a second, different reset in the same period: no
+// upstream contract says which same-period constraint is representative.
+func (p quotaPeriods) add(seconds int64, reset time.Time) bool {
+	if previous, exists := p[seconds]; exists && !reset.Equal(previous) {
+		return false
+	}
+	p[seconds] = reset
+	return true
 }
 
 // CheckEnabled verifies the host's effective registration without reading auth.
@@ -229,7 +275,7 @@ func (s *Synchronizer) Sync(ctx context.Context) (Round, error) {
 		result := Result{Name: file.Name, Provider: file.Provider, Priority: -1, QueryStatus: "unsupported_provider", WriteStatus: "not_attempted", Persistence: "unverified"}
 		query, status := s.quotaQuery(ctx, file, names[file.Name] == 1)
 		result.QueryStatus = status
-		for attempt := 0; query != nil && attempt < 2; attempt++ {
+		for attempt := 0; query != nil && attempt < queryAttempts; attempt++ {
 			sequences[i], result.QueryStatus = query()
 			// Codex retries usage and cards separately; never replay its whole query.
 			if file.Provider == "codex" || !retryQuery(ctx, result.QueryStatus) {
@@ -315,7 +361,7 @@ func compare(a, b []time.Time) int {
 // quotaQuery resolves provider prerequisites once; only upstream queries are
 // retried. Codex owns its per-request retries. A nil query leaves auth unsortable.
 func (s *Synchronizer) quotaQuery(ctx context.Context, file authFile, uniqueName bool) (func() ([]time.Time, string), string) {
-	if file.Provider != "codex" && file.Provider != "xai" && !isKimi(file.Provider) {
+	if file.Provider != "codex" && file.Provider != "antigravity" && file.Provider != "xai" && !isKimi(file.Provider) {
 		return nil, "unsupported_provider"
 	}
 	if file.Index == "" {
@@ -323,6 +369,17 @@ func (s *Synchronizer) quotaQuery(ctx context.Context, file authFile, uniqueName
 	}
 	if file.Provider == "codex" {
 		return func() ([]time.Time, string) { return s.codex(ctx, file) }, "ok"
+	}
+	if file.Provider == "antigravity" {
+		if strings.TrimSpace(file.ProjectID) == "" {
+			return nil, "missing_project_id"
+		}
+		attempt := 0
+		return func() ([]time.Time, string) {
+			sequence, status := s.antigravity(ctx, file, attempt)
+			attempt++
+			return sequence, status
+		}, "ok"
 	}
 	// Metadata download is by filename; never guess between duplicate names.
 	if !uniqueName {
