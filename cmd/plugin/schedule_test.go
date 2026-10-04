@@ -129,6 +129,15 @@ func TestCronSkipsMissedRoundsAndShutdownJoinsBeforeHostRelease(t *testing.T) {
 			}
 			return response(200, `{"status":"ok"}`), nil
 		case "POST /v8/management/requests/api-call":
+			var call struct {
+				URL string `json:"url"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&call); err != nil {
+				return nil, err
+			}
+			if call.URL == "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits" {
+				return response(200, `{"status_code":200,"body":"{\"available_count\":0,\"credits\":[]}"}`), nil
+			}
 			mu.Lock()
 			queries++
 			n := queries

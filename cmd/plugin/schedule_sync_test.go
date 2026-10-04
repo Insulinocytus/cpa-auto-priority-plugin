@@ -57,7 +57,13 @@ func (s *scheduledStore) RoundTrip(r *http.Request) (*http.Response, error) {
 		if err := json.NewDecoder(r.Body).Decode(&call); err != nil {
 			return nil, err
 		}
-		if call.Method != "GET" || call.URL != "https://chatgpt.com/backend-api/wham/usage" || call.Proxy != nil {
+		if call.Method != "GET" || call.Proxy != nil {
+			return nil, fmt.Errorf("invalid quota contract")
+		}
+		if call.URL == "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits" {
+			return jsonReply(200, map[string]any{"status_code": 200, "body": `{"available_count":0,"credits":[]}`})
+		}
+		if call.URL != "https://chatgpt.com/backend-api/wham/usage" {
 			return nil, fmt.Errorf("invalid quota contract")
 		}
 		s.queries[call.Index]++
@@ -185,5 +191,69 @@ func TestCronManagementAuthenticationFailureStopsSchedule(t *testing.T) {
 				t.Fatalf("identical key retried management authentication: %+v", state)
 			}
 		})
+	}
+}
+
+func TestCronReenableDuringDisabledRoundRestartsSync(t *testing.T) {
+	a, b := scheduledAuth("a", "codex"), scheduledAuth("b", "codex")
+	s := &scheduledStore{files: []map[string]any{a, b}, usage: map[string]string{"a": quota("2026-10-08T00:00:00Z"), "b": quota("2026-10-12T00:00:00Z")}, queries: map[string]int{}, writes: map[string]int{}}
+	entered, release := make(chan struct{}), make(chan struct{})
+	pauseNext := false
+	p, clock := newTestRuntime(&http.Client{Transport: transportFunc(func(r *http.Request) (*http.Response, error) {
+		s.mu.Lock()
+		pause := pauseNext && r.URL.Path == "/v8/management/plugins"
+		if pause {
+			pauseNext = false
+		}
+		s.mu.Unlock()
+		response, err := s.RoundTrip(r)
+		if pause {
+			// Capture the disabled snapshot before re-enable, delaying delivery.
+			close(entered)
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		}
+		return response, err
+	})})
+	defer p.stop()
+	if err := p.configure(lifecycle(validConfig)); err != nil {
+		t.Fatal(err)
+	}
+	first := clock.Await(t)
+	s.mu.Lock()
+	s.disabled, pauseNext = true, true
+	s.usage["a"] = quota("2026-10-20T00:00:00Z")
+	s.mu.Unlock()
+	clock.Fire(first)
+	<-entered
+	var rpc envelope
+	if err := json.Unmarshal(p.handle("plugin.reconfigure", lifecycle(validConfig)), &rpc); err != nil || !rpc.OK {
+		t.Fatalf("re-enable failed: %v %+v", err, rpc)
+	}
+	close(release)
+	// Real host ordering: publish enabled only after reconfigure returns.
+	readiness := clock.Await(t)
+	if state := p.getStatus(); state.Phase != "waiting" || state.Error != "plugin_not_enabled" {
+		t.Fatalf("re-enabled worker did not wait for host publication: %+v", state)
+	}
+	s.mu.Lock()
+	s.disabled = false
+	s.mu.Unlock()
+	clock.Fire(readiness)
+	next := clock.Await(t)
+	s.mu.Lock()
+	if a["priority"] != 0 || b["priority"] != 1 {
+		t.Errorf("re-enable did not sync current quota: a=%v b=%v", a["priority"], b["priority"])
+	}
+	s.usage["b"] = quota("2026-10-24T00:00:00Z")
+	s.mu.Unlock()
+	clock.Fire(next)
+	clock.Await(t)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if a["priority"] != 1 || b["priority"] != 0 {
+		t.Errorf("cron lost after re-enable: a=%v b=%v", a["priority"], b["priority"])
 	}
 }

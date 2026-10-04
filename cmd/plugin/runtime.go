@@ -85,13 +85,26 @@ func (p *pluginRuntime) configure(raw []byte) error {
 	if p.cancel != nil && config == p.config {
 		select {
 		case <-p.done:
-			// A disabled host re-enables with identical config; restart it.
 			// Management 401/403 still needs a changed key to avoid an IP ban.
 			if p.getStatus().Error == priority.ErrManagementAuthentication.Error() {
 				return nil
 			}
 		default:
-			return nil
+			state := p.getStatus()
+			if state.Phase == "starting" || state.Phase == "waiting" || state.Error == priority.ErrManagementAuthentication.Error() {
+				return nil
+			}
+			// Re-enable RPC precedes host publication. An in-flight disabled
+			// round may still be exiting; cancel and join it before replacing it.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err := syncer.CheckEnabled(ctx)
+			cancel()
+			if err == nil {
+				return nil
+			}
+			if !errors.Is(err, priority.ErrPluginNotEnabled) {
+				return err
+			}
 		}
 	}
 	p.stopLocked()
