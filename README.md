@@ -101,7 +101,7 @@ UT 使用固定时钟和有状态 HTTP transport adapter：不监听端口、不
 
 调度 UT 使用受控时钟推进触发，不等待真实午夜、不监听端口、不访问网络/账号。验证首次一次执行、默认宿主时区日历零点、显式 cron/timezone、DST 23/25 小时跨日、非法配置保留旧任务、auth 新增/移除、自然重置后的新档位、两次查询上限、-1 隔离、仅 priority 更新、写失败不重试、长轮次跳过触发、关闭取消并等待宿主请求结束，以及关闭后没有后台访问。时间超时仅用作测试死锁 watchdog，不作为调度推进。
 
-**尚未具备的验收前提：** 当前完整入口没有重置卡接入（[Codex #3](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/3)、[Claude #4](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/4)），因此不能声称已验证“卡被消费后的新排序”。接入后自动由相同入口调度；该 UT 需使用真实卡契约补齐，不用合成伪字段替代。本次不加载真实插件、不做真实宿主/账号 smoke。
+**重置卡：** 当前完整入口没有重置卡接入，“卡被消费后的新排序”由 [Codex #3](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/3) 通过同一 `Sync` 入口的连续两轮 UT 验收，不用合成伪字段替代。接入后自动由相同入口调度。本次不加载真实插件、不做真实宿主/账号 smoke。
 
 先前实现阶段完成过 Windows `c-shared` 编译（未加载）和无网络、受控 transport 的单轮入口运行检查。本工单的调度验证只使用上述 UT，不做 smoke、真实插件加载或真实账号验证。
 
