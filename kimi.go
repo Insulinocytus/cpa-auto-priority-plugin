@@ -65,7 +65,7 @@ func kimiURL(metadata map[string]json.RawMessage, file authFile) (string, string
 }
 
 func (s *Synchronizer) kimi(ctx context.Context, file authFile, endpoint string) ([]time.Time, string) {
-	payload, status := s.quotaGET(ctx, file, endpoint, map[string]string{"Authorization": "Bearer $TOKEN$"})
+	payload, status := s.upstream(ctx, file.Index, "GET", endpoint, map[string]string{"Authorization": "Bearer $TOKEN$"}, "")
 	if status != "ok" {
 		return nil, status
 	}
@@ -149,7 +149,7 @@ func (s *Synchronizer) kimi(ctx context.Context, file authFile, endpoint string)
 	if len(periods) == 0 {
 		return nil, "no_reset_time"
 	}
-	return periodSequence(periods), "ok"
+	return ordered(periods)
 }
 
 func kimiPeriod(item, detail map[string]json.RawMessage, fallback int64) (int64, bool) {

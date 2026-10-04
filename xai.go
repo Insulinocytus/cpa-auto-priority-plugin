@@ -35,7 +35,7 @@ func xaiHeaders(metadata map[string]json.RawMessage) (map[string]string, string)
 }
 
 func (s *Synchronizer) xai(ctx context.Context, file authFile, headers map[string]string) ([]time.Time, string) {
-	payload, status := s.quotaGET(ctx, file, "https://cli-chat-proxy.grok.com/v1/billing?format=credits", headers)
+	payload, status := s.upstream(ctx, file.Index, "GET", "https://cli-chat-proxy.grok.com/v1/billing?format=credits", headers, "")
 	if status != "ok" {
 		return nil, status
 	}
