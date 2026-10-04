@@ -25,7 +25,7 @@ func (s *Synchronizer) devin(ctx context.Context, file authFile) ([]time.Time, s
 			} `json:"planStatus"`
 		} `json:"userStatus"`
 	}
-	if json.Unmarshal(payload, &response) != nil {
+	if len(payload) == 0 || payload[0] != '{' || json.Unmarshal(payload, &response) != nil {
 		return nil, "quota_response_malformed"
 	}
 	if response.UserStatus == nil || response.UserStatus.PlanStatus == nil {

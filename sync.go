@@ -194,6 +194,10 @@ func (s *Synchronizer) Sync(ctx context.Context) (Round, error) {
 	}
 	files := make([]authFile, 0, len(*snapshot.Files))
 	ids := make(map[string]bool)
+	names := make(map[string]int, len(*snapshot.Files))
+	for _, file := range *snapshot.Files {
+		names[file.Name]++
+	}
 	for _, file := range *snapshot.Files {
 		if file.RuntimeOnly == nil || *file.RuntimeOnly || file.Source != "file" || file.Path == "" {
 			continue
@@ -220,13 +224,18 @@ func (s *Synchronizer) Sync(ctx context.Context) (Round, error) {
 	groups := make(map[string][]int)
 	for i, file := range files {
 		result := Result{Name: file.Name, Provider: file.Provider, Priority: -1, QueryStatus: "unsupported_provider", WriteStatus: "not_attempted", Persistence: "unverified"}
-		sequences[i], result.QueryStatus = s.quota(ctx, file)
+		sequences[i], result.QueryStatus = s.quota(ctx, file, names[file.Name] == 1)
 		if result.QueryStatus == ErrManagementAuthentication.Error() {
 			round.Results = append(round.Results, result)
 			return round, ErrManagementAuthentication
 		}
 		if len(sequences[i]) > 0 {
-			groups[file.Provider] = append(groups[file.Provider], i)
+			// Pinned host executorKeyFromAuth schedules these aliases together.
+			group := map[string]string{"kimi.com": "kimi", "kimi.ai": "kimi-ai"}[file.Provider]
+			if group == "" {
+				group = file.Provider
+			}
+			groups[group] = append(groups[group], i)
 		}
 		round.Results = append(round.Results, result)
 	}
@@ -290,4 +299,12 @@ func compare(a, b []time.Time) int {
 		return 1
 	}
 	return 0
+}
+
+// Provider parsing establishes validity and scope; this shared synchronization
+// rule only lowers an existing period's sorting time, never creates a window.
+func applyCardExpiry(periods map[int64]time.Time, duration int64, expiry time.Time) {
+	if reset, exists := periods[duration]; exists && !expiry.IsZero() && expiry.Before(reset) {
+		periods[duration] = expiry
+	}
 }

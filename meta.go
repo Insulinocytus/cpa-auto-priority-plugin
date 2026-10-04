@@ -42,7 +42,7 @@ func (s *Synchronizer) meta(ctx context.Context, file authFile, dca string) ([]t
 	var response struct {
 		Usage json.RawMessage `json:"subs_usage"`
 	}
-	if json.Unmarshal(payload, &response) != nil {
+	if len(payload) == 0 || payload[0] != '{' || json.Unmarshal(payload, &response) != nil {
 		return nil, "quota_response_malformed"
 	}
 	// A valid body without subs_usage (e.g. before the first request) is an

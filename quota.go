@@ -7,18 +7,24 @@ import (
 	"errors"
 	"math"
 	"math/big"
+	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
 )
 
 // quota is the single provider decision point: unknown providers are never
 // queried, and every supported query needs the selected auth_index.
-func (s *Synchronizer) quota(ctx context.Context, file authFile) ([]time.Time, string) {
+func (s *Synchronizer) quota(ctx context.Context, file authFile, uniqueName bool) ([]time.Time, string) {
 	var query func() ([]time.Time, string)
 	switch file.Provider {
 	case "codex":
-		query = func() ([]time.Time, string) { return s.codex(ctx, file) }
+		if file.Index == "" {
+			return nil, "missing_auth_index"
+		}
+		// Codex owns usage and card retries separately; never replay both.
+		return s.codex(ctx, file)
 	case "devin":
 		query = func() ([]time.Time, string) { return s.devin(ctx, file) }
 	case "meta":
@@ -31,6 +37,31 @@ func (s *Synchronizer) quota(ctx context.Context, file authFile) ([]time.Time, s
 			if dca, status = retryOnce(ctx, func() (string, string) { return s.metaDCA(ctx, file) }); status != "ok" {
 				return nil, status
 			}
+		}
+	case "kimi", "kimi-ai", "kimi.ai", "kimi.com", "xai":
+		if file.Index == "" {
+			return nil, "missing_auth_index"
+		}
+		// Metadata download is by filename; never guess between duplicate names.
+		if !uniqueName {
+			return nil, "auth_metadata_ambiguous"
+		}
+		metadata, status := s.quotaMetadata(ctx, file)
+		if status != "ok" {
+			return nil, status
+		}
+		if isKimi(file.Provider) {
+			endpoint, status := kimiURL(metadata, file)
+			if status != "ok" {
+				return nil, status
+			}
+			query = func() ([]time.Time, string) { return s.kimi(ctx, file, endpoint) }
+		} else {
+			headers, status := xaiHeaders(metadata)
+			if status != "ok" {
+				return nil, status
+			}
+			query = func() ([]time.Time, string) { return s.xai(ctx, file, headers) }
 		}
 	default:
 		return nil, "unsupported_provider"
@@ -158,6 +189,54 @@ func number(raw json.RawMessage) (float64, error) {
 	return value, nil
 }
 
+// Download is a filename lookup, unlike the ID-based narrow write. The caller
+// rejects ambiguous names; tokens are always resolved from the selected index.
+func (s *Synchronizer) quotaMetadata(ctx context.Context, file authFile) (map[string]json.RawMessage, string) {
+	if strings.ContainsAny(file.Name, "/\\") || !strings.HasSuffix(strings.ToLower(file.Name), ".json") {
+		return nil, "auth_metadata_unavailable"
+	}
+	var metadata map[string]json.RawMessage
+	var err error
+	for range 2 {
+		err = s.request(ctx, "GET", "credentials/download?name="+url.QueryEscape(file.Name), nil, &metadata)
+		if err == nil && metadata != nil {
+			return metadata, "ok"
+		}
+		if err == ErrManagementAuthentication || ctx.Err() != nil {
+			break
+		}
+	}
+	if err == ErrManagementAuthentication {
+		return nil, err.Error()
+	}
+	return nil, "auth_metadata_unavailable"
+}
+
+func rawString(raw json.RawMessage) string {
+	var value string
+	_ = json.Unmarshal(raw, &value)
+	return strings.TrimSpace(value)
+}
+
+// Official UI classifies 28–31 day windows as one monthly period.
+const monthLayer = 31 * 86400
+
+func quotaLayer(seconds int64) int64 {
+	if seconds >= 28*86400 && seconds <= monthLayer {
+		return monthLayer
+	}
+	return seconds
+}
+
+// relativeSeconds parses a non-negative countdown anchored by the caller.
+func relativeSeconds(raw json.RawMessage) (time.Duration, bool) {
+	seconds, err := number(raw)
+	if err != nil || seconds < 0 || seconds >= float64(math.MaxInt64)/float64(time.Second) {
+		return 0, false
+	}
+	return time.Duration(seconds * float64(time.Second)), true
+}
+
 // upstream proxies one provider request through the selected auth. The host
 // resolves $TOKEN$ and applies that auth's proxy; no proxy_url override is sent.
 func (s *Synchronizer) upstream(ctx context.Context, index, method, url string, headers map[string]string, data string) ([]byte, string) {
@@ -182,8 +261,16 @@ func (s *Synchronizer) upstream(ctx context.Context, index, method, url string, 
 		return nil, "upstream_http_failed"
 	}
 	payload := bytes.TrimSpace([]byte(response.Body))
-	if len(payload) == 0 || payload[0] != '{' {
-		return nil, "quota_response_malformed"
-	}
 	return payload, "ok"
 }
+
+func jsonObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {
+	raw = bytes.TrimSpace(raw)
+	var value map[string]json.RawMessage
+	if len(raw) == 0 || raw[0] != '{' || json.Unmarshal(raw, &value) != nil {
+		return nil, false
+	}
+	return value, true
+}
+
+func nonNull(raw json.RawMessage) bool { return len(raw) > 0 && !isNull(raw) }
