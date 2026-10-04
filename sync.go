@@ -20,6 +20,9 @@ const PluginID = "cpa-auto-priority"
 // ErrManagementAuthentication stops a round on management HTTP 401/403.
 var ErrManagementAuthentication = errors.New("management_authentication_failed")
 
+// ErrPluginNotEnabled prevents work after the host removes this registration.
+var ErrPluginNotEnabled = errors.New("plugin_not_enabled")
+
 // Config uses an explicit management origin and its plaintext management key.
 // The key is never included in observable errors or results.
 type Config struct {
@@ -139,7 +142,7 @@ func (s *Synchronizer) enabled(ctx context.Context) error {
 			return nil
 		}
 	}
-	return errors.New("plugin_not_enabled")
+	return ErrPluginNotEnabled
 }
 
 // Pinned fields validation rejects virtual auth before checking for absent

@@ -1,6 +1,6 @@
 # CPA Auto Priority
 
-CLIProxyAPI 原生 Go 插件：宿主管理接口就绪后立即执行一轮 Codex **自然额度重置** priority 同步。对应 [issue #2](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/2)。不实现后续工单的 cron、重置卡或其他 provider 查询。
+CLIProxyAPI 原生 Go 插件：宿主管理接口就绪后立即执行一轮 Codex **自然额度重置** priority 同步，此后按标准五字段 cron 重复执行同一完整同步入口。对应 [issue #2](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/2) 和 [issue #8](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/8)。重置卡与其他 provider 查询由各自接入工单实现，本次调度不假造这些数据契约。
 
 ## 构建与配置
 
@@ -23,6 +23,8 @@ plugins:
       priority: 0                 # 宿主插件加载顺序，不是认证文件的 priority
       management_url: http://127.0.0.1:8317
       management_key: YOUR_MANAGEMENT_KEY
+      cron: "0 0 * * *"          # 可省略；每天日历零点，不是每隔 24 小时
+      timezone: Asia/Shanghai   # 可省略；默认宿主进程的系统时区
 ```
 
 `management_url` 是**该宿主**的 HTTP(S) origin，不能含用户名、路径、query 或 fragment。非 loopback 必须 HTTPS；管理密钥必须明确提供，loopback 也需要鉴权。不会跟随 HTTP redirect。保护配置文件权限；宿主 ConfigField 没有 secret 类型，插件不能保证管理 UI 隐藏此配置。不得将密钥提交到版本库。
@@ -40,7 +42,7 @@ Authorization: Bearer <management key>
 {"phase":"completed","round":{"status":"completed","results":[{"name":"account.json","provider":"codex","priority":0,"query_status":"ok","write_status":"acknowledged","persistence":"unverified"}]}}
 ```
 
-没有手动触发、外部替代代理、定时调度或数据库。可复用的 Go 入口是 `priority.New(config, client, now)` 和 `Synchronizer.Sync(ctx)`；`client=nil` 使用带 30 秒超时的 HTTP client，`now=nil` 使用当前时刻。同实例单轮串行，取消后不继续写入。
+没有手动触发、外部替代代理或数据库。可复用的 Go 入口是 `priority.New(config, client, now)` 和 `Synchronizer.Sync(ctx)`；`client=nil` 使用带 30 秒超时的 HTTP client，`now=nil` 使用当前时刻。同实例单轮串行，取消后不继续写入。
 
 ## 单轮规则
 
@@ -55,9 +57,17 @@ Authorization: Bearer <management key>
 8. 必要额度请求失败或 malformed 仅重试失败请求一次；仍失败、401 明确失效、无任何可用自然重置、缺查询索引、未知 provider 均只将该物理认证设为 -1，其余继续。成功确认缺少/null 的短窗口不是失败；已有窗口的损坏周期/时间是失败。有效窗口的时间明确为 null/缺失时不虚构时间。不会拿订阅或 token 过期代替重置时间。
 9. 写前再次确认启用状态，仅 `PATCH /v8/management/credentials/fields {"name":"<id>","priority":N}`。不提交完整 auth JSON，不改变 disabled、token、代理或其他业务字段。写入失败返回 `write_status=failed`，不重试、不回滚，继续尝试其他认证；HTTP 2xx 且 `status=ok` 仅为 `acknowledged`，**从不声称磁盘持久化已验证**。
 
-管理 HTTP 层的 401/403 与 Codex 上游 401 不同：任一管理请求返回 401/403 时，本轮立即终止，返回 `priority.ErrManagementAuthentication`（`management_authentication_failed`），启动状态为 `failed`；不重试、不继续其他查询或 priority 写入。即使错误正文为空或不是 JSON，也按 HTTP 状态处理，不输出正文。普通查询/写入失败仍按上述规则隔离。宿主会在同一来源 IP 鉴权失败 5 次后封禁 30 分钟（包括 loopback），因此不能将错误管理密钥当作未就绪无限轮询。修正管理配置后 reconfigure 启动新一轮；已有宿主 IP 封禁不会被插件清除。
+管理 HTTP 层的 401/403 与 Codex 上游 401 不同：任一管理请求返回 401/403 时，本轮立即终止，返回 `priority.ErrManagementAuthentication`（`management_authentication_failed`），状态为 `failed`，**同时停止后续 cron**；不重试、不继续其他查询或 priority 写入。即使错误正文为空或不是 JSON，也按 HTTP 状态处理，不输出正文。普通查询/写入失败仍按上述规则隔离，下次日历触发才开始新轮次。宿主会在同一来源 IP 鉴权失败 5 次后封禁 30 分钟（包括 loopback），因此不能将错误管理密钥当作未就绪无限轮询。修正管理配置后 reconfigure 启动新一轮；已有宿主 IP 封禁不会被插件清除。
 
-后台只轮询宿主就绪（每秒），不是无限重试 provider 或 priority 写入。监听或响应结构未就绪时状态为 `waiting`；管理 401/403 则终止为 `failed`，不把 init 的空集合报为成功。就绪后真的空集合为 `empty`，不写入且不叫成功同步。相同配置的 reconfigure 幂等；配置改变先验证，再取消并等待旧任务，启动新一轮。quiesce/原生 shutdown 取消并等待后台退出。
+## 调度与生命周期
+
+- `cron` 的五字段依次为分钟、小时、月中日期、月份、星期，支持通配符、列表、范围、步长和英文月份/星期名；星期为 `0–6`（星期日为 0）。默认 `0 0 * * *`。不接受秒字段、`@daily`/`@every`、`?` 或表达式内的 `TZ=`/`CRON_TZ=`；时区只能通过 `timezone` 设置。月中日期和星期同时限制时采用标准 cron 的 OR 语义。非法表达式、不可能的日历日期和非法时区显式返回 `invalid_cron`/`invalid_timezone`，不会换成默认时间表。
+- `timezone` 使用 IANA 名称，如 `Asia/Shanghai`、`America/New_York` 或 `UTC`；省略或空字符串采用宿主进程的 `time.Local`，容器中通常由容器时区配置决定。内嵌 Go 时区数据库，宿主无 zoneinfo 文件时仍可使用明确的 IANA 覆盖。按日历计算下一次触发，DST 跨日可以是 23 或 25 小时；不存在的当地时刻跳过，重复的当地时刻按 cron 日历匹配。
+- 原生 init 不启动同步、不保存宿主回调指针或请求作用域 `host_callback_id`。register/reconfigure 启动实例后台任务，沿用明确鉴权的管理 HTTP 入口，不使用宿主 `scheduler.pick`，不改变认证选择策略。
+- 首次同步前每秒只轮询宿主就绪；监听或快照结构未就绪时状态为 `waiting`，管理 401/403 则终止为 `failed`。初次 auth 加载与监听开放的顺序依据下述 pinned 普通模式源码；不把 init 的空集合报为成功。就绪后真的空集合为 `empty`，不写入；仍保持 cron，以便下一轮发现新增认证文件。
+- 首次同步与后续触发全部调用同一 `Synchronizer.Sync`，每轮重新枚举物理认证文件并取得当前额度数据，不缓存前一轮排序时间。一个后台 worker 串行执行；长轮次覆盖的触发直接跳过，结束后计算未来的下一个日历时刻，不建立队列或追赶执行。仅使用 `robfig/cron/v3` 的解析器和 `Next`，不启用其 job runner，不添加查询/写入重试。
+- 相同配置的 reconfigure 幂等；配置改变先完整验证，再取消并等待旧 generation，启动一次新的首次同步。非法配置保留旧 generation。`enabled: false` 的 reconfigure、`plugin.quiesce`、`plugin.shutdown` 和原生 shutdown 都取消并等待 worker 退出，返回后没有本实例任务继续访问宿主。
+- 宿主仅切换 disable 而不发送生命周期通知时，仍存在下述 TOCTOU 限制：定时等待无法立即获知禁用；下一轮的启用检查返回 `priority.ErrPluginNotEnabled`（`plugin_not_enabled`）后停止 worker，不再读取认证、查询额度或写入 priority。此行为不是实际共享库卸载验证。
 
 ## 固定兼容契约与证据
 
@@ -69,6 +79,7 @@ Authorization: Bearer <management key>
 - [非变更探测、virtual guard 与窄更新](https://github.com/router-for-me/CLIProxyAPI/blob/8ef43e4df3b216a42493105d31c2873b69191473/internal/api/handlers/management/auth_files_fields.go#L257-L415)、[manager 列表/GetByID 返回 clone](https://github.com/router-for-me/CLIProxyAPI/blob/8ef43e4df3b216a42493105d31c2873b69191473/sdk/cliproxy/auth/conductor_selection.go#L1520-L1543)。探测依赖此版本校验顺序和有限错误文本；升级宿主需重新核对，不能把未知 400/409 当成功。
 - [代发请求与代理选择](https://github.com/router-for-me/CLIProxyAPI/blob/8ef43e4df3b216a42493105d31c2873b69191473/internal/api/handlers/management/api_tools.go#L32-L238)、[持久化失败可能只记录日志](https://github.com/router-for-me/CLIProxyAPI/blob/8ef43e4df3b216a42493105d31c2873b69191473/sdk/cliproxy/auth/conductor_lifecycle.go#L273-L307)。
 - [管理鉴权与来源 IP 封禁规则](https://github.com/router-for-me/CLIProxyAPI/blob/8ef43e4df3b216a42493105d31c2873b69191473/internal/api/handlers/management/handler.go#L301-L392)：401/403 是管理访问失败，不是可无限重试的启动就绪信号。
+- [原生卸载顺序](https://github.com/router-for-me/CLIProxyAPI/blob/8ef43e4df3b216a42493105d31c2873b69191473/internal/pluginhost/loader_unix.go#L237-L268)：宿主先关闭 HTTP callback instance，再调用插件 shutdown，随后释放回调表并卸载库。本插件不使用该 callback instance；shutdown 同步 join 自己的 HTTP worker。源码核对与受控 UT 不证明真实卸载安全性。
 
 Codex 基准：[官方管理界面 `ee79a79`](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/tree/ee79a794526a30c03748a8864a9ac6589a31833b)。这是第一手实现证据，不是 OpenAI 正式发布的 wham schema：
 
@@ -80,14 +91,18 @@ Codex 基准：[官方管理界面 `ee79a79`](https://github.com/router-for-me/C
 ## 测试
 
 ```sh
-go test sync_test.go                         # 完整单轮 seam 的定向 UT
-go test ./cmd/plugin -run 'TestStartup|TestShutdown|TestInvalid'
+go test . -run TestSync                     # 完整单轮 seam 的定向 UT
+go test ./cmd/plugin -run 'TestStartup|TestShutdown|TestInvalid|TestCron|TestReadiness'
 go vet ./...                                # 类型/静态检查
 go test -race ./...                         # 最终完整 UT，含并发检查
 ```
 
 UT 使用固定时钟和有状态 HTTP transport adapter：不监听端口、不访问真实网络/账号、不加载真实宿主。覆盖多周期 precedence、跨套餐/缺层/同档、输入顺序、provider 隔离、ISO/秒/毫秒/相对时间及跨年、重试隔离、virtual/配置项排除、仅 priority 变化、并发 token 刷新保留、写入失败、显式鉴权/代理语义、敏感数据不泄露、配置注册/reconfigure/取消退出；管理读取、物理认证探测、额度代发及 priority 写入的 401/403 立即终止，修正密钥后可重新配置恢复。
 
-实现阶段另外完成 Windows `c-shared` 编译（未加载）和无网络、受控 transport 的单轮入口运行检查；临时程序与构建产物已移除。这些检查同样不证明真实宿主或磁盘兼容性。
+调度 UT 使用受控时钟推进触发，不等待真实午夜、不监听端口、不访问网络/账号。验证首次一次执行、默认宿主时区日历零点、显式 cron/timezone、DST 23/25 小时跨日、非法配置保留旧任务、auth 新增/移除、自然重置后的新档位、两次查询上限、-1 隔离、仅 priority 更新、写失败不重试、长轮次跳过触发、关闭取消并等待宿主请求结束，以及关闭后没有后台访问。时间超时仅用作测试死锁 watchdog，不作为调度推进。
+
+**尚未具备的验收前提：** 当前完整入口没有重置卡接入（[Codex #3](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/3)、[Claude #4](https://github.com/Insulinocytus/cpa-auto-priority-plugin/issues/4)），因此不能声称已验证“卡被消费后的新排序”。接入后自动由相同入口调度；该 UT 需使用真实卡契约补齐，不用合成伪字段替代。本次不加载真实插件、不做真实宿主/账号 smoke。
+
+先前实现阶段完成过 Windows `c-shared` 编译（未加载）和无网络、受控 transport 的单轮入口运行检查。本次另外通过临时直接入口程序观察首次与 cron 的空快照、New York 春季 DST 的 23 小时间隔，以及 shutdown join；临时程序已移除。该受控运行检查不连接真实宿主，也不证明真实宿主或磁盘兼容性。
 
 **未验证：** 真实共享库加载、部署平台运行时 ABI、实际管理鉴权、真实账号接口、宿主内存与磁盘持久化兼容性。UT 和源码核对不能证明这些运行时性质；不安排真实宿主/账号 smoke。

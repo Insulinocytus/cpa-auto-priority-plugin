@@ -6,18 +6,23 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
+	_ "time/tzdata"
 
 	priority "github.com/Insulinocytus/cpa-auto-priority-plugin"
+	"github.com/robfig/cron/v3"
 	"gopkg.in/yaml.v3"
 )
 
 const statusPath = "/auto-priority/status"
 
 type pluginConfig struct {
-	Enabled         bool `yaml:"enabled"`
-	Priority        int  `yaml:"priority"`
+	Enabled         bool   `yaml:"enabled"`
+	Priority        int    `yaml:"priority"`
+	Cron            string `yaml:"cron"`
+	Timezone        string `yaml:"timezone"`
 	priority.Config `yaml:",inline"`
 }
 
@@ -35,10 +40,23 @@ type pluginRuntime struct {
 	done      chan struct{}
 	state     status
 	client    *http.Client
+	now       func() time.Time
+	wait      func(context.Context, time.Duration) bool
 }
 
 func newRuntime(client *http.Client) *pluginRuntime {
-	return &pluginRuntime{client: client, state: status{Phase: "not_configured"}}
+	return &pluginRuntime{client: client, now: time.Now, wait: waitFor, state: status{Phase: "not_configured"}}
+}
+
+func waitFor(ctx context.Context, delay time.Duration) bool {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return ctx.Err() == nil
+	}
 }
 
 func (p *pluginRuntime) configure(raw []byte) error {
@@ -54,7 +72,34 @@ func (p *pluginRuntime) configure(raw []byte) error {
 	if decoder.Decode(&config) != nil {
 		return errors.New("invalid_plugin_config")
 	}
-	syncer, err := priority.New(config.Config, p.client, nil)
+	if config.Cron == "" {
+		config.Cron = "0 0 * * *"
+	}
+	fields := strings.Fields(config.Cron)
+	if len(fields) != 5 || strings.Contains(config.Cron, "?") {
+		return errors.New("invalid_cron: expected standard five fields")
+	}
+	for _, field := range fields {
+		if strings.HasPrefix(field, ",") || strings.HasSuffix(field, ",") || strings.Contains(field, ",,") {
+			return errors.New("invalid_cron: empty list item")
+		}
+	}
+	schedule, err := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow).Parse(config.Cron)
+	if err != nil {
+		return errors.New("invalid_cron: expected standard five fields")
+	}
+	location := time.Local
+	if config.Timezone != "" {
+		location, err = time.LoadLocation(config.Timezone)
+		if err != nil {
+			return errors.New("invalid_timezone")
+		}
+	}
+	schedule.(*cron.SpecSchedule).Location = location
+	if schedule.Next(p.now().In(location)).IsZero() {
+		return errors.New("invalid_cron: no calendar occurrence")
+	}
+	syncer, err := priority.New(config.Config, p.client, p.now)
 	if err != nil {
 		return err
 	}
@@ -73,12 +118,13 @@ func (p *pluginRuntime) configure(raw []byte) error {
 	p.cancel = cancel
 	p.done = make(chan struct{})
 	p.setStatus(status{Phase: "starting"})
-	go p.startup(ctx, p.done, syncer)
+	go p.run(ctx, p.done, syncer, schedule.(*cron.SpecSchedule))
 	return nil
 }
 
-func (p *pluginRuntime) startup(ctx context.Context, done chan struct{}, syncer *priority.Synchronizer) {
+func (p *pluginRuntime) run(ctx context.Context, done chan struct{}, syncer *priority.Synchronizer, schedule *cron.SpecSchedule) {
 	defer close(done)
+	started := false
 	for {
 		round, err := syncer.Sync(ctx)
 		if ctx.Err() != nil {
@@ -86,21 +132,32 @@ func (p *pluginRuntime) startup(ctx context.Context, done chan struct{}, syncer 
 		}
 		if err == nil {
 			p.setStatus(status{Phase: round.Status, Round: &round})
-			return
-		}
-		// Authentication retries can ban the shared management client IP.
-		// Once a round has auth results, never rerun it automatically either.
-		if errors.Is(err, priority.ErrManagementAuthentication) || len(round.Results) > 0 {
+		} else {
 			p.setStatus(status{Phase: "failed", Error: err.Error(), Round: &round})
+			// Management auth retries can ban the shared client IP. Disable
+			// is not a reason to retain a periodic background worker either.
+			if errors.Is(err, priority.ErrManagementAuthentication) || (started && errors.Is(err, priority.ErrPluginNotEnabled)) {
+				return
+			}
+			if !started && len(round.Results) == 0 {
+				p.setStatus(status{Phase: "waiting", Error: err.Error()})
+				if !p.wait(ctx, time.Second) {
+					return
+				}
+				continue
+			}
+		}
+		started = true
+		// One worker owns both triggers and Sync. Missed occurrences during
+		// a long round are skipped, never queued or replayed.
+		now := p.now().In(schedule.Location)
+		next := schedule.Next(now)
+		if next.IsZero() {
+			p.setStatus(status{Phase: "failed", Error: "invalid_cron: no calendar occurrence"})
 			return
 		}
-		p.setStatus(status{Phase: "waiting", Error: err.Error()})
-		timer := time.NewTimer(time.Second)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
+		if !p.wait(ctx, next.Sub(now)) || ctx.Err() != nil {
 			return
-		case <-timer.C:
 		}
 	}
 }
@@ -162,7 +219,7 @@ func (p *pluginRuntime) handle(method string, raw []byte) []byte {
 		p.stop()
 		return rpcSuccess(struct{}{})
 	case "management.register":
-		return rpcSuccess(map[string]any{"routes": []any{map[string]any{"Method": "GET", "Path": statusPath, "Description": "Last startup priority sync; persistence is unverified."}}})
+		return rpcSuccess(map[string]any{"routes": []any{map[string]any{"Method": "GET", "Path": statusPath, "Description": "Last priority sync; persistence is unverified."}}})
 	case "management.handle":
 		var request struct {
 			Method string
@@ -199,6 +256,8 @@ func registration() any {
 			"ConfigFields": []any{
 				map[string]string{"Name": "management_url", "Type": "string", "Description": "This host's management origin; HTTPS is required off loopback."},
 				map[string]string{"Name": "management_key", "Type": "string", "Description": "Explicit management key; protect the host configuration file."},
+				map[string]string{"Name": "cron", "Type": "string", "Description": "Standard five-field cron; default 0 0 * * * (calendar midnight)."},
+				map[string]string{"Name": "timezone", "Type": "string", "Description": "IANA timezone override; default host system timezone."},
 			},
 		},
 		"capabilities": map[string]bool{"management_api": true},
