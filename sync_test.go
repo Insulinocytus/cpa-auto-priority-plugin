@@ -25,6 +25,7 @@ type managementStore struct {
 	cardStatus     map[string]int
 	cardQueryCount map[string]int
 	queryCount     map[string]int
+	queryURLs      map[string][]string
 	writeCount     map[string]int
 	writeFailure   map[string]bool
 	key            string
@@ -43,7 +44,7 @@ type managementStore struct {
 }
 
 func store(files ...map[string]any) *managementStore {
-	return &managementStore{files: files, usage: map[string][]string{}, cards: map[string][]string{}, cardStatus: map[string]int{}, cardQueryCount: map[string]int{}, upstreamStatus: map[string]int{}, queryCount: map[string]int{}, writeCount: map[string]int{}, writeFailure: map[string]bool{}, metadata: map[string]string{}, metadataCount: map[string]int{}, expectedURL: map[string]string{}, expectedUserID: map[string]string{}, key: "management-secret"}
+	return &managementStore{files: files, usage: map[string][]string{}, cards: map[string][]string{}, cardStatus: map[string]int{}, cardQueryCount: map[string]int{}, upstreamStatus: map[string]int{}, queryCount: map[string]int{}, queryURLs: map[string][]string{}, writeCount: map[string]int{}, writeFailure: map[string]bool{}, metadata: map[string]string{}, metadataCount: map[string]int{}, expectedURL: map[string]string{}, expectedUserID: map[string]string{}, key: "management-secret"}
 }
 
 func credential(name, provider string) map[string]any {
@@ -87,13 +88,14 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 			Method    string            `json:"method"`
 			URL       string            `json:"url"`
 			Header    map[string]string `json:"header"`
+			Data      string            `json:"data"`
 			ProxyURL  *string           `json:"proxy_url"`
 		}
 		if err := json.NewDecoder(req.Body).Decode(&call); err != nil {
 			return nil, err
 		}
 		isCard := call.URL == "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
-		if call.Method != "GET" || call.Header["Authorization"] != "Bearer $TOKEN$" || call.ProxyURL != nil {
+		if call.Header["Authorization"] != "Bearer $TOKEN$" || call.ProxyURL != nil {
 			return jsonResponse(400, map[string]any{"error": "invalid query contract"}), nil
 		}
 		var selected map[string]any
@@ -109,6 +111,9 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 		if selected == nil {
 			return jsonResponse(400, map[string]any{"error": "missing auth"}), nil
 		}
+		if selected["provider"] != "antigravity" && call.Method != "GET" {
+			return jsonResponse(400, map[string]any{"error": "invalid query contract"}), nil
+		}
 		if expected := s.expectedURL[call.AuthIndex]; expected != "" && call.URL != expected {
 			return jsonResponse(400, map[string]any{"error": "account quota is only available on its own domain"}), nil
 		}
@@ -119,6 +124,13 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 		case "codex":
 			if !isCard && call.URL != "https://chatgpt.com/backend-api/wham/usage" {
 				return jsonResponse(400, map[string]any{"error": "wrong codex endpoint"}), nil
+			}
+		case "antigravity":
+			// Official endpoints and the project exposed for the selected auth.
+			project, _ := json.Marshal(map[string]any{"project": selected["project_id"]})
+			official := map[string]bool{dailyQuotaURL: true, sandboxQuotaURL: true, "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary": true}
+			if call.Method != "POST" || !official[call.URL] || call.Header["User-Agent"] != "antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)" || call.Data != string(project) {
+				return jsonResponse(400, map[string]any{"error": "invalid query contract"}), nil
 			}
 		case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
 			if call.URL != "https://api.kimi.com/coding/v1/usages" && call.URL != "https://api.kimi.ai/coding/v1/usages" {
@@ -154,6 +166,7 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 			}
 			return jsonResponse(200, map[string]any{"status_code": status, "body": responses[index]}), nil
 		}
+		s.queryURLs[call.AuthIndex] = append(s.queryURLs[call.AuthIndex], call.URL)
 		index := s.queryCount[call.AuthIndex]
 		s.queryCount[call.AuthIndex]++
 		if s.disableOnQuery {

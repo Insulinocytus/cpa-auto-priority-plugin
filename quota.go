@@ -74,26 +74,7 @@ func relativeSeconds(raw json.RawMessage) (time.Duration, bool) {
 }
 
 func (s *Synchronizer) quotaGET(ctx context.Context, file authFile, endpoint string, headers map[string]string) ([]byte, string) {
-	call := struct {
-		AuthIndex string            `json:"auth_index"`
-		Method    string            `json:"method"`
-		URL       string            `json:"url"`
-		Header    map[string]string `json:"header"`
-	}{file.Index, "GET", endpoint, headers}
-	var response struct {
-		Status int    `json:"status_code"`
-		Body   string `json:"body"`
-	}
-	if err := s.request(ctx, "POST", "requests/api-call", call, &response); err != nil {
-		return nil, err.Error()
-	}
-	if response.Status == 401 {
-		return nil, "credentials_invalid"
-	}
-	if response.Status < 200 || response.Status >= 300 {
-		return nil, "upstream_http_failed"
-	}
-	return []byte(response.Body), "ok"
+	return s.upstream(ctx, apiCall{AuthIndex: file.Index, Method: "GET", URL: endpoint, Header: headers})
 }
 
 func jsonObject(raw json.RawMessage) (map[string]json.RawMessage, bool) {

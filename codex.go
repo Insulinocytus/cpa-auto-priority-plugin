@@ -77,7 +77,7 @@ func (s *Synchronizer) codexUsage(ctx context.Context, file authFile) (map[int64
 	}
 	// Only the account-wide rate_limit is comparable. Code review and named
 	// additional_rate_limits are separate uses/models, not extra account periods.
-	periods := map[int64]time.Time{}
+	periods := quotaPeriods{}
 	for _, raw := range []json.RawMessage{limits.Primary, limits.Secondary} {
 		if len(raw) == 0 || isNull(raw) {
 			continue
@@ -111,12 +111,9 @@ func (s *Synchronizer) codexUsage(ctx context.Context, file authFile) (map[int64
 		if err != nil {
 			return nil, "quota_response_malformed"
 		}
-		// No upstream contract explains distinct resets for duplicate generic
-		// periods. Do not guess which constraint is representative.
-		if previous, exists := periods[duration]; exists && !reset.Equal(previous) {
+		if !periods.add(duration, reset) {
 			return nil, "quota_period_ambiguous"
 		}
-		periods[duration] = reset
 	}
 	if len(periods) == 0 {
 		return nil, "no_reset_time"
