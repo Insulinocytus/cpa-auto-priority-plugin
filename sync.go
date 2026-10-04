@@ -220,18 +220,13 @@ func (s *Synchronizer) Sync(ctx context.Context) (Round, error) {
 	groups := make(map[string][]int)
 	for i, file := range files {
 		result := Result{Name: file.Name, Provider: file.Provider, Priority: -1, QueryStatus: "unsupported_provider", WriteStatus: "not_attempted", Persistence: "unverified"}
-		if file.Provider == "codex" {
+		if file.Provider == "codex" || file.Provider == "devin" || file.Provider == "meta" {
 			result.QueryStatus = "missing_auth_index"
 			if file.Index != "" {
-				for range 2 {
-					sequences[i], result.QueryStatus = s.codex(ctx, file)
-					if result.QueryStatus == ErrManagementAuthentication.Error() {
-						round.Results = append(round.Results, result)
-						return round, ErrManagementAuthentication
-					}
-					if result.QueryStatus == "ok" || result.QueryStatus == "no_reset_time" || result.QueryStatus == "credentials_invalid" || ctx.Err() != nil {
-						break
-					}
+				sequences[i], result.QueryStatus = s.quota(ctx, file)
+				if result.QueryStatus == ErrManagementAuthentication.Error() {
+					round.Results = append(round.Results, result)
+					return round, ErrManagementAuthentication
 				}
 			}
 		}
@@ -281,6 +276,37 @@ func (s *Synchronizer) Sync(ctx context.Context) (Round, error) {
 		}
 	}
 	return round, nil
+}
+
+func (s *Synchronizer) quota(ctx context.Context, file authFile) ([]time.Time, string) {
+	switch file.Provider {
+	case "codex":
+		return retryOnce(ctx, func() ([]time.Time, string) { return s.codex(ctx, file) })
+	case "devin":
+		return retryOnce(ctx, func() ([]time.Time, string) { return s.devin(ctx, file) })
+	default:
+		// The DCA download and the quota call are separate necessary requests;
+		// a succeeded download is not repeated when only the quota call fails.
+		dca, status := retryOnce(ctx, func() (string, string) { return s.metaDCA(ctx, file) })
+		if status != "ok" {
+			return nil, status
+		}
+		return retryOnce(ctx, func() ([]time.Time, string) { return s.meta(ctx, file, dca) })
+	}
+}
+
+// retryOnce repeats a failed necessary request once. Definitive outcomes and
+// management authentication failures are never repeated.
+func retryOnce[T any](ctx context.Context, query func() (T, string)) (T, string) {
+	value, status := query()
+	switch status {
+	case "ok", "no_reset_time", "credentials_invalid", "missing_dca_token", ErrManagementAuthentication.Error():
+		return value, status
+	}
+	if ctx.Err() != nil {
+		return value, status
+	}
+	return query()
 }
 
 // Earlier instants win; if the common prefix ties, more known layers win.

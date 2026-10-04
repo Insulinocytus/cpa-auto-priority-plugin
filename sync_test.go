@@ -24,6 +24,8 @@ type managementStore struct {
 	queryCount     map[string]int
 	writeCount     map[string]int
 	writeFailure   map[string]bool
+	downloadCount  map[string]int
+	downloadFail   map[string]int
 	key            string
 	refresh        bool
 	disabled       bool
@@ -35,8 +37,14 @@ type managementStore struct {
 	accountID      string
 }
 
+const (
+	codexURL = "https://chatgpt.com/backend-api/wham/usage"
+	devinURL = "https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus"
+	metaURL  = "https://api.meta.ai/muse-code/key"
+)
+
 func store(files ...map[string]any) *managementStore {
-	return &managementStore{files: files, usage: map[string][]string{}, upstreamStatus: map[string]int{}, queryCount: map[string]int{}, writeCount: map[string]int{}, writeFailure: map[string]bool{}, key: "management-secret"}
+	return &managementStore{files: files, usage: map[string][]string{}, upstreamStatus: map[string]int{}, queryCount: map[string]int{}, writeCount: map[string]int{}, writeFailure: map[string]bool{}, downloadCount: map[string]int{}, downloadFail: map[string]int{}, key: "management-secret"}
 }
 
 func credential(name, provider string) map[string]any {
@@ -66,30 +74,52 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 			}
 		}
 		return response, nil
+	case "GET /v8/management/credentials/download":
+		// Like the host, read the persisted file by name, secrets included.
+		name := req.URL.Query().Get("name")
+		for _, file := range s.files {
+			if file["name"] == name {
+				s.downloadCount[name]++
+				if s.downloadFail[name] > 0 {
+					s.downloadFail[name]--
+					return jsonResponse(500, map[string]any{"error": "read failed"}), nil
+				}
+				return jsonResponse(200, file), nil
+			}
+		}
+		return jsonResponse(404, map[string]any{"error": "file not found"}), nil
 	case "POST /v8/management/requests/api-call":
 		var call struct {
 			AuthIndex string            `json:"auth_index"`
 			Method    string            `json:"method"`
 			URL       string            `json:"url"`
 			Header    map[string]string `json:"header"`
+			Data      string            `json:"data"`
 			ProxyURL  *string           `json:"proxy_url"`
 		}
 		if err := json.NewDecoder(req.Body).Decode(&call); err != nil {
 			return nil, err
 		}
-		if call.Method != "GET" || call.URL != "https://chatgpt.com/backend-api/wham/usage" || call.Header["Authorization"] != "Bearer $TOKEN$" || call.ProxyURL != nil {
-			return jsonResponse(400, map[string]any{"error": "invalid query contract"}), nil
-		}
-		for _, file := range s.files {
-			if file["auth_index"] == call.AuthIndex {
-				s.selectedProxy, _ = file["proxy_url"].(string)
+		var file map[string]any
+		for _, candidate := range s.files {
+			if candidate["auth_index"] == call.AuthIndex {
+				file = candidate
 			}
 		}
+		if file == nil || call.ProxyURL != nil || !validUpstreamCall(call.Method, call.URL, call.Header, call.Data) {
+			return jsonResponse(400, map[string]any{"error": "invalid query contract"}), nil
+		}
+		s.selectedProxy, _ = file["proxy_url"].(string)
 		s.accountID = call.Header["Chatgpt-Account-Id"]
 		index := s.queryCount[call.AuthIndex]
 		s.queryCount[call.AuthIndex]++
 		if s.disableOnQuery {
 			s.disabled = true
+		}
+		status := s.upstreamStatus[call.AuthIndex]
+		// Meta rejects anything but the persisted DCA token, e.g. the LLM key.
+		if call.URL == metaURL && call.Header["Authorization"] != "Bearer "+fmt.Sprint(file["dca_token"]) {
+			status = 401
 		}
 		responses := s.usage[call.AuthIndex]
 		if len(responses) == 0 {
@@ -98,7 +128,6 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 		if index >= len(responses) {
 			index = len(responses) - 1
 		}
-		status := s.upstreamStatus[call.AuthIndex]
 		if status == 0 {
 			status = 200
 		}
@@ -149,6 +178,25 @@ func (s *managementStore) RoundTrip(req *http.Request) (*http.Response, error) {
 	default:
 		return nil, fmt.Errorf("unexpected request %s %s", req.Method, req.URL)
 	}
+}
+
+// The provider request contracts verified in docs/research. Bodies containing
+// $TOKEN$ are resolved by the host from the selected auth, never by the plugin.
+func validUpstreamCall(method, url string, header map[string]string, data string) bool {
+	switch url {
+	case codexURL:
+		return method == "GET" && header["Authorization"] == "Bearer $TOKEN$"
+	case devinURL:
+		var body struct {
+			Metadata struct {
+				APIKey string `json:"apiKey"`
+			} `json:"metadata"`
+		}
+		return method == "POST" && header["Content-Type"] == "application/json" && header["Connect-Protocol-Version"] == "1" && json.Unmarshal([]byte(data), &body) == nil && body.Metadata.APIKey == "$TOKEN$"
+	case metaURL:
+		return method == "POST" && data == "{}" && header["x-api-version"] == "1.0.0" && !strings.Contains(header["Authorization"], "$TOKEN$")
+	}
+	return false
 }
 
 func synchronizer(t *testing.T, s *managementStore) *priority.Synchronizer {
@@ -496,6 +544,152 @@ func TestSyncEquivalentFractionalInstantsShareRank(t *testing.T) {
 				if file["priority"] != 0 {
 					t.Fatalf("equivalent instant split into ranks: %v", s.files)
 				}
+			}
+		})
+	}
+}
+
+// Synthetic GetUserStatus bodies in the Connect-JSON shape parsed by the
+// official UI (int64 as strings or numbers); not captured account responses.
+func devinStatus(weekly, daily string) string {
+	return fmt.Sprintf(`{"userStatus":{"email":"pii@example.com","apiKey":"devin-secret","planStatus":{"planInfo":{"planName":"Pro"},"planStart":"2026-01-01T00:00:00Z","planEnd":"2026-10-05T00:00:00Z","weeklyQuotaRemainingPercent":3,"dailyQuotaRemainingPercent":100%s%s}}}`, weekly, daily)
+}
+
+func TestSyncDevinWeeklyBeforeDailyInUnixSeconds(t *testing.T) {
+	s := store(credential("A", "devin"), credential("B", "devin"), credential("C", "devin"), credential("E", "devin"), credential("plan-only", "devin"), credential("codex", "codex"), credential("unset", "devin"), credential("broken", "devin"))
+	s.usage["A"] = []string{devinStatus(`,"weeklyQuotaResetAtUnix":"1798761600"`, `,"dailyQuotaResetAtUnix":"1798675200"`)}
+	s.usage["B"] = []string{devinStatus(`,"weeklyQuotaResetAtUnix":1798761600`, `,"dailyQuotaResetAtUnix":"1798704000"`)}
+	s.usage["C"] = []string{devinStatus(`,"weeklyQuotaResetAtUnix":"1798848000"`, `,"dailyQuotaResetAtUnix":"1798588800"`)}
+	s.usage["E"] = []string{devinStatus(`,"weeklyQuotaResetAtUnix":"1798761600"`, ``)}
+	// planEnd is subscription lifetime, not a quota reset.
+	s.usage["plan-only"] = []string{devinStatus(``, ``)}
+	s.usage["codex"] = []string{`{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"reset_at":1}}}`}
+	// Proto3 zero means unset; a non-numeric reset is malformed, not absent.
+	s.usage["unset"] = []string{devinStatus(`,"weeklyQuotaResetAtUnix":"0"`, `,"dailyQuotaResetAtUnix":0`)}
+	s.usage["broken"] = []string{devinStatus(`,"weeklyQuotaResetAtUnix":"next week"`, `,"dailyQuotaResetAtUnix":"1798675200"`)}
+	round, err := synchronizer(t, s).Sync(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{"C": 0, "E": 1, "B": 2, "A": 3, "plan-only": -1, "codex": 0, "unset": -1, "broken": -1}
+	for _, file := range s.files {
+		if file["priority"] != want[file["name"].(string)] {
+			t.Errorf("%s rank=%v want=%v", file["name"], file["priority"], want[file["name"].(string)])
+		}
+	}
+	if round.Results[4].QueryStatus != "no_reset_time" || s.queryCount["plan-only"] != 1 || round.Results[6].QueryStatus != "no_reset_time" || round.Results[7].QueryStatus != "quota_response_malformed" || s.queryCount["broken"] != 2 {
+		t.Fatalf("plan time used, absence retried or malformed accepted: %+v %v", round.Results, s.queryCount)
+	}
+	if encoded, _ := json.Marshal(round); strings.Contains(string(encoded), "devin-secret") || strings.Contains(string(encoded), "pii@") {
+		t.Fatal("result leaks Devin response")
+	}
+}
+
+// Synthetic muse-code/key bodies in the shape parsed by the official UI. The
+// endpoint can echo api_key and PII, so each body carries both.
+func metaUsage(window, weekly string) string {
+	return fmt.Sprintf(`{"api_key":"meta-returned-key","email":"pii@example.com","is_subs_active":true,"subs_tier_name":"Pro","subs_usage":{"tier":"pro","window":{"used_percent":12,"window_duration_mins":300,"resets_at":%s},"weekly":{"used_percent":40,"resets_at":%s}}}`, window, weekly)
+}
+
+func metaCredential(name string) map[string]any {
+	file := credential(name, "meta")
+	file["dca_token"] = "dca:" + name
+	file["api_key"] = "llm-key-" + name
+	return file
+}
+
+func TestSyncMetaUsesPersistedDCAAndRanksWithOtherProvidersInOneRound(t *testing.T) {
+	llmOnly := metaCredential("llm-only")
+	delete(llmOnly, "dca_token")
+	notDCA := metaCredential("not-dca")
+	notDCA["dca_token"] = "llm-key-not-dca"
+	disabled := metaCredential("disabled-early")
+	disabled["disabled"] = true
+	s := store(metaCredential("late"), disabled, llmOnly, notDCA, metaCredential("same-week"), credential("devin", "devin"), credential("codex", "codex"))
+	s.usage["late"] = []string{metaUsage("1798700000", "1798848000")}
+	s.usage["disabled-early"] = []string{metaUsage("1798700000", "1798761600")}
+	s.usage["same-week"] = []string{metaUsage("1798710000", "1798761600")}
+	s.usage["llm-only"] = []string{metaUsage("1798700000", "1798761600")}
+	s.usage["not-dca"] = s.usage["llm-only"]
+	s.usage["devin"] = []string{devinStatus(`,"weeklyQuotaResetAtUnix":"1798761600"`, ``)}
+	s.usage["codex"] = []string{`{"rate_limit":{"primary_window":{"limit_window_seconds":604800,"reset_at":1798761600}}}`}
+	before := map[string]map[string]any{}
+	for _, file := range s.files {
+		copy := map[string]any{}
+		for k, v := range file {
+			copy[k] = v
+		}
+		before[file["name"].(string)] = copy
+	}
+	round, err := synchronizer(t, s).Sync(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]int{"late": 0, "same-week": 1, "disabled-early": 2, "llm-only": -1, "not-dca": -1, "devin": 0, "codex": 0}
+	for _, file := range s.files {
+		name := file["name"].(string)
+		before[name]["priority"] = want[name]
+		if !reflect.DeepEqual(file, before[name]) {
+			t.Errorf("unexpected business state for %s: %#v", name, file)
+		}
+	}
+	for _, result := range round.Results {
+		if (result.Name == "llm-only" || result.Name == "not-dca") && result.QueryStatus != "missing_dca_token" {
+			t.Errorf("LLM key accepted as DCA: %+v", result)
+		}
+		if result.WriteStatus != "acknowledged" {
+			t.Errorf("not written in this round: %+v", result)
+		}
+	}
+	if s.queryCount["llm-only"] != 0 || s.queryCount["not-dca"] != 0 || s.downloadCount["late"] != 1 || s.queryCount["late"] != 1 {
+		t.Fatalf("requests: queries=%v downloads=%v", s.queryCount, s.downloadCount)
+	}
+	encoded, _ := json.Marshal(round)
+	for _, secret := range []string{"dca:", "llm-key", "meta-returned-key", "pii@", "old-token"} {
+		if strings.Contains(string(encoded), secret) {
+			t.Errorf("result leaks %s", secret)
+		}
+	}
+}
+
+func TestSyncMetaUnknownQuotaFailuresAndRetryIsolation(t *testing.T) {
+	valid := metaUsage("1798700000", "1798761600")
+	for _, tc := range []struct {
+		name                         string
+		responses                    []string
+		status, downloadFailures     int
+		priority, downloads, queries int
+		query                        string
+	}{
+		{"no-subs-usage", []string{`{"api_key":"meta-returned-key","is_subs_active":false}`}, 200, 0, -1, 1, 1, "no_reset_time"},
+		{"null-resets", []string{`{"subs_usage":{"window":null,"weekly":{"used_percent":0,"resets_at":null}}}`}, 200, 0, -1, 1, 1, "no_reset_time"},
+		{"weekly-only", []string{`{"subs_usage":{"weekly":{"resets_at":"1798761600"}}}`}, 200, 0, 1, 1, 1, "ok"},
+		{"not-json", []string{`<html>meta-returned-key</html>`}, 200, 0, -1, 1, 2, "quota_response_malformed"},
+		{"bad-usage", []string{`{"subs_usage":[]}`}, 200, 0, -1, 1, 2, "quota_response_malformed"},
+		{"bad-reset", []string{metaUsage(`"soon"`, "1798761600")}, 200, 0, -1, 1, 2, "quota_response_malformed"},
+		{"window-without-period", []string{`{"subs_usage":{"window":{"resets_at":1798700000}}}`}, 200, 0, -1, 1, 2, "quota_response_malformed"},
+		{"ambiguous-week", []string{`{"subs_usage":{"window":{"window_duration_mins":10080,"resets_at":1798700000},"weekly":{"resets_at":1798761600}}}`}, 200, 0, -1, 1, 2, "quota_period_ambiguous"},
+		{"upstream-failure", []string{`{"error":"meta-returned-key"}`}, 500, 0, -1, 1, 2, "upstream_http_failed"},
+		{"invalid-dca", []string{valid}, 401, 0, -1, 1, 1, "credentials_invalid"},
+		{"query-recovers", []string{`{"subs_usage":"x"}`, valid}, 200, 0, 1, 1, 2, "ok"},
+		{"download-recovers", []string{valid}, 200, 1, 1, 2, 1, "ok"},
+		{"download-fails", []string{valid}, 200, 2, -1, 2, 0, "management_http_failed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := store(metaCredential("candidate"), metaCredential("healthy"))
+			s.usage["candidate"] = tc.responses
+			s.upstreamStatus["candidate"] = tc.status
+			s.downloadFail["candidate"] = tc.downloadFailures
+			s.usage["healthy"] = []string{metaUsage("1798700000", "1798848000")}
+			round, err := synchronizer(t, s).Sync(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if s.files[0]["priority"] != tc.priority || s.files[1]["priority"] != 0 || s.downloadCount["candidate"] != tc.downloads || s.queryCount["candidate"] != tc.queries || s.queryCount["healthy"] != 1 || round.Results[0].QueryStatus != tc.query {
+				t.Fatalf("state=%v downloads=%v queries=%v results=%+v", s.files, s.downloadCount, s.queryCount, round.Results)
+			}
+			if encoded, _ := json.Marshal(round); strings.Contains(string(encoded), "meta-returned-key") {
+				t.Fatal("result leaks Meta response")
 			}
 		})
 	}

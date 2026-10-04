@@ -12,17 +12,16 @@ import (
 	"time"
 )
 
-func (s *Synchronizer) codex(ctx context.Context, file authFile) ([]time.Time, string) {
-	headers := map[string]string{"Authorization": "Bearer $TOKEN$", "Content-Type": "application/json", "User-Agent": "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)"}
-	if file.IDToken.AccountID != "" {
-		headers["Chatgpt-Account-Id"] = file.IDToken.AccountID
-	}
+// upstream proxies one provider request through the selected auth. The host
+// resolves $TOKEN$ and applies that auth's proxy; no proxy_url override is sent.
+func (s *Synchronizer) upstream(ctx context.Context, index, method, url string, headers map[string]string, data string) ([]byte, string) {
 	call := struct {
 		AuthIndex string            `json:"auth_index"`
 		Method    string            `json:"method"`
 		URL       string            `json:"url"`
 		Header    map[string]string `json:"header"`
-	}{file.Index, "GET", "https://chatgpt.com/backend-api/wham/usage", headers}
+		Data      string            `json:"data,omitempty"`
+	}{index, method, url, headers, data}
 	var response struct {
 		Status int    `json:"status_code"`
 		Body   string `json:"body"`
@@ -36,12 +35,27 @@ func (s *Synchronizer) codex(ctx context.Context, file authFile) ([]time.Time, s
 	if response.Status < 200 || response.Status >= 300 {
 		return nil, "upstream_http_failed"
 	}
+	payload := bytes.TrimSpace([]byte(response.Body))
+	if len(payload) == 0 || payload[0] != '{' {
+		return nil, "quota_response_malformed"
+	}
+	return payload, "ok"
+}
+
+func (s *Synchronizer) codex(ctx context.Context, file authFile) ([]time.Time, string) {
+	headers := map[string]string{"Authorization": "Bearer $TOKEN$", "Content-Type": "application/json", "User-Agent": "codex-tui/0.149.1 (Mac OS 26.5.2; arm64) iTerm.app/3.6.11 (codex-tui; 0.149.1)"}
+	if file.IDToken.AccountID != "" {
+		headers["Chatgpt-Account-Id"] = file.IDToken.AccountID
+	}
+	payload, status := s.upstream(ctx, file.Index, "GET", "https://chatgpt.com/backend-api/wham/usage", headers, "")
+	if status != "ok" {
+		return nil, status
+	}
 	observed := s.now()
 	var usage struct {
 		RateLimit json.RawMessage `json:"rate_limit"`
 	}
-	payload := bytes.TrimSpace([]byte(response.Body))
-	if len(payload) == 0 || payload[0] != '{' || json.Unmarshal(payload, &usage) != nil {
+	if json.Unmarshal(payload, &usage) != nil {
 		return nil, "quota_response_malformed"
 	}
 	if len(usage.RateLimit) == 0 || isNull(usage.RateLimit) {
@@ -94,13 +108,25 @@ func (s *Synchronizer) codex(ctx context.Context, file authFile) ([]time.Time, s
 		if err != nil {
 			return nil, "quota_response_malformed"
 		}
-		// No upstream contract explains distinct resets for duplicate generic
-		// periods. Do not guess which constraint is representative.
-		if previous, exists := periods[duration]; exists && !reset.Equal(previous) {
+		if !addPeriod(periods, duration, reset) {
 			return nil, "quota_period_ambiguous"
 		}
-		periods[duration] = reset
 	}
+	return ordered(periods)
+}
+
+// No upstream contract explains distinct resets for duplicate generic periods.
+// Do not guess which constraint is representative.
+func addPeriod(periods map[int64]time.Time, duration int64, reset time.Time) bool {
+	if previous, exists := periods[duration]; exists && !reset.Equal(previous) {
+		return false
+	}
+	periods[duration] = reset
+	return true
+}
+
+// ordered lists reset instants from the longest quota period to the shortest.
+func ordered(periods map[int64]time.Time) ([]time.Time, string) {
 	if len(periods) == 0 {
 		return nil, "no_reset_time"
 	}
@@ -141,12 +167,28 @@ func instant(raw json.RawMessage) (time.Time, error) {
 	} else {
 		text = string(raw)
 	}
+	return unix(text, true)
+}
+
+// unixSeconds parses a field whose contract fixes the unit to Unix seconds:
+// no millisecond heuristic applies. Numeric strings are accepted.
+func unixSeconds(raw json.RawMessage) (time.Time, error) {
+	text := string(raw)
+	if len(text) > 0 && text[0] == '"' && json.Unmarshal(raw, &text) != nil {
+		return time.Time{}, errors.New("invalid_time")
+	}
+	return unix(text, false)
+}
+
+// unix converts positive numeric text in Unix seconds, or in milliseconds at
+// or above the official helper's 1e11 boundary when detection is requested.
+func unix(text string, detectMilliseconds bool) (time.Time, error) {
 	value, err := strconv.ParseFloat(text, 64)
 	if err != nil || value <= 0 || math.IsNaN(value) || math.IsInf(value, 0) {
 		return time.Time{}, errors.New("invalid_time")
 	}
 	unit := int64(time.Second)
-	if value >= 1e11 {
+	if detectMilliseconds && value >= 1e11 {
 		unit = int64(time.Millisecond)
 	}
 	if value*float64(unit)/float64(time.Second) > 253402300799 {
