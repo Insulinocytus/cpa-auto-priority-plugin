@@ -144,7 +144,7 @@ plugins:
 
 | 配置项 | 说明 |
 | --- | --- |
-| `management_url` | 宿主的 HTTP(S) origin，例如 `http://127.0.0.1:8317`。不能带路径（包括 `/v0/management`）、query、fragment 或用户名密码。非 loopback 地址必须用 HTTPS。 |
+| `management_url` | 宿主的 HTTP(S) origin，必须带 `http://` 或 `https://`，不能带路径（包括 `/v0/management`）、query、fragment 或用户名密码。插件运行在宿主进程内，填 `http://127.0.0.1:<宿主端口>` 即可；Docker 部署同样填容器内的端口，而不是映射到宿主机的端口。非 loopback 地址必须用 HTTPS。 |
 | `management_key` | 宿主的 management key，必填，本机访问也需要。 |
 | `cron` | 标准 5 段 cron，默认 `0 0 * * *`，例如 `*/30 * * * *` 表示每半小时。不支持秒字段、`@daily` / `@every`、`?` 及内嵌时区。 |
 | `timezone` | IANA 时区名，例如 `Asia/Shanghai`、`UTC`。 |
@@ -156,7 +156,10 @@ plugins:
 
 ### 3. 加载插件
 
-宿主在启动和重载配置时扫描插件目录，并加载已启用的插件；如果保存配置后插件没有出现，重启 CLIProxyAPI。加载成功后，管理中心的插件列表中会显示 `cpa-auto-priority`。插件会等待 management API 就绪后自动执行第一轮同步，无需单独启动进程，也没有手动触发接口。
+宿主在启动和重载配置时扫描插件目录，并加载已启用的插件；如果保存配置后插件没有出现，重启 CLIProxyAPI。加载成功后，管理中心的插件列表中会显示 `cpa-auto-priority`，宿主日志中会出现 `pluginhost: plugin registered plugin_id=cpa-auto-priority`。插件会等待 management API 就绪后自动执行第一轮同步，无需单独启动进程，也没有手动触发接口。
+
+> [!TIP]
+> 使用官方 Docker 镜像时，宿主的工作目录是 `/CLIProxyAPI`，把插件目录挂载到 `/CLIProxyAPI/plugins` 即可，例如 `- ./plugins:/CLIProxyAPI/plugins`。
 
 ### 更新插件
 
@@ -205,7 +208,14 @@ curl -H "Authorization: Bearer YOUR_MANAGEMENT_KEY" \
 
 | 现象 | 处理 |
 | --- | --- |
-| 状态接口返回 404 | 插件没有注册成功。检查文件名、扩展名和所在目录，全局与插件自身的 `enabled`，然后在宿主日志中搜索 `pluginhost`；配置非法（如 `invalid_management_url`、`invalid_cron`）也会导致注册失败。 |
+| 管理中心显示「未注册」/ 状态接口返回 404 | 插件没有注册成功。先确认全局与插件自身的 `enabled` 都为 `true`，再在宿主日志中搜索 `pluginhost`（Docker 用 `docker logs <容器名> 2>&1 \| grep pluginhost`），按下面几行处理。 |
+| 日志出现 `plugin loaded` 之后又有 `plugin.register failed: ...` | 文件已成功加载，是插件拒绝了配置；冒号后面是具体错误码。紧随其后的 `returned invalid metadata or no capabilities` 是同一原因导致的，无需单独处理。 |
+| `invalid_management_url: expected HTTP(S) origin ...` | `management_url` 缺少 `http://`、带了路径（如 `/v0/management`）或 query，或者没有写在 `cpa-auto-priority:` 下面。改成 `http://127.0.0.1:<宿主端口>`。 |
+| `invalid_management_url: remote management requires HTTPS` | `http://` 后面不是本机地址（如公网 IP、域名、Docker 服务名）。改用 `127.0.0.1`，或改用 HTTPS。 |
+| `invalid_management_key` | `management_key` 为空或含换行。 |
+| `invalid_plugin_config` | 配置中有拼错或多余的字段，或 YAML 缩进有误。对照[配置宿主](#2-配置宿主)中的字段检查。 |
+| `failed to load plugin ... dlopen ...` | 共享库无法加载：包的架构与宿主不一致（`uname -m`），glibc 低于 2.17，或系统使用 musl。 |
+| `requires cgo on this platform` | 宿主是不支持插件的构建（如 `_no-plugin` 版本），请换用官方标准版或 Docker 镜像。 |
 | 一直是 `waiting` | 首轮就绪检查未通过。检查 `management_url`、宿主日志和版本兼容性。 |
 | `empty` | 没有可更新的物理认证文件（只处理 `source` 为 `file` 的认证文件）。后续 cron 仍会检查新增文件。 |
 | `management_authentication_failed` | management key 错误或被宿主拒绝。定时任务会就此停止，用同一个 key 重新配置**不会**重试；改成正确的 key 后才会恢复。 |
@@ -224,7 +234,7 @@ curl -H "Authorization: Bearer YOUR_MANAGEMENT_KEY" \
 - 停用插件会停止后续同步，已写入的 `priority` 保持不变。
 
 > [!NOTE]
-> 本插件尚未在真实 CLIProxyAPI 部署和真实账号上完成验证，也不保证宿主的磁盘持久化行为。建议先用少量认证文件确认效果；升级宿主后请重新确认兼容性。
+> 已在 CLIProxyAPI v8.0.15 官方 Docker 镜像（Linux）上实际加载，并对 Claude、Codex 的 OAuth 认证文件完成同步和写回。其他 Provider 尚未用真实账号验证，宿主的磁盘持久化也未经插件确认（`persistence` 恒为 `unverified`）。建议先用少量认证文件确认效果；升级宿主后请重新确认兼容性。
 
 ## 开发
 
