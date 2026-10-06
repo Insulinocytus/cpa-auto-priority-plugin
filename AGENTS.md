@@ -100,8 +100,8 @@ go build -buildmode=c-shared -o cpa-auto-priority.dll ./cmd/plugin   # Linux 用
   - 配置的 URL 只接受 http(s)；纯 http 只允许 loopback。不允许 userinfo、path、query。key 里不能含 CR/LF。
 - 写回只用窄 PATCH `{name: <auth id>, priority}`，不传 `auth_index`，也不碰 `disabled` 等其他字段。不要用 `host.auth.save`，它是整文件保存。`Persistence` 永远记为 `unverified`，因为 HTTP 200 不代表落盘。
 - 配置只来自 host 下发的 `config_yaml`，没有环境变量或 flag：
-  - 支持的 key：`enabled`、`priority`、`cron`（默认 `0 0 * * *`）、`timezone`（IANA，默认 host 本地时区，已嵌入 `time/tzdata`）、`management_url`、`management_key`。
-  - 解码使用 `KnownFields(true)`，未知 key 会报 `invalid_plugin_config`。
+  - 支持的 key：`enabled`、`priority`、`cron`（默认 `0 0 * * *`）、`timezone`（IANA，默认 host 本地时区，已嵌入 `time/tzdata`）、`management_url`、`management_key`。另有 `store`：host 从插件商店安装时写入的安装记录，插件只接受、不校验也不读取（`hostOwned`）。
+  - 解码使用 `KnownFields(true)`，其余未知 key 会报 `invalid_plugin_config`。
   - `pluginConfig` 必须保持可比较（用 `==` 判断配置是否相同）。
   - 非法的 reconfigure 不影响正在运行的那一代配置。
 - cron 只接受标准 5 段格式，不支持 `@descriptor`、`CRON_TZ=`/`TZ=`、秒字段、`?`，也不允许空列表项。只用 robfig 的 `Parse`/`Next`，不用它的 runner。
@@ -117,7 +117,7 @@ go build -buildmode=c-shared -o cpa-auto-priority.dll ./cmd/plugin   # Linux 用
   - 响应用 `C.CBytes` 分配，由 host 通过 `cliproxyPluginFree` 释放。
 - `cmd/plugin/runtime.go`：
   - `pluginRuntime.configure/run/stop/handle`。
-  - `registration()`：schema_version 6，Version `0.1.0`。
+  - `registration()`：schema_version 6，Version `0.1.1`。
   - `parseSchedule`。
 - `sync.go`：
   - `New(config, client, now)`：HTTP 和观测时间是仅有的两个注入点。

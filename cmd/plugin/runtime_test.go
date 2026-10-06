@@ -263,3 +263,62 @@ func TestInvalidReconfigurationPreservesRunningGeneration(t *testing.T) {
 		t.Fatal("bad config stopped valid generation")
 	}
 }
+
+// Synthesized from the pinned host's pluginstore.Manifest YAML tags, as
+// enablePluginConfigLocked writes it on a store install.
+const storeInstallRecord = `store:
+  schema-version: 1
+  id: cpa-auto-priority
+  name: CPA Auto Priority
+  description: synthetic
+  author: Insulinocytus
+  version: 0.1.1
+  release-tag: v0.1.1
+  repository: https://github.com/Insulinocytus/cpa-auto-priority-plugin
+  license: MIT
+  tags: [Management]
+  source-id: official
+  source-name: Official
+  source-url: https://raw.githubusercontent.com/router-for-me/CLIProxyAPI-Plugins-Store/main/registry.json
+  install:
+    type: github-release
+`
+
+func TestStoreInstallRecordIsAcceptedButTyposAreNot(t *testing.T) {
+	for _, tc := range []struct {
+		name, config string
+		ok           bool
+	}{
+		{"store record", validConfig + storeInstallRecord, true},
+		{"store record with typo", validConfig + storeInstallRecord + "management_ur: http://127.0.0.1:8317\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, clock := newTestRuntime(&http.Client{Transport: transportFunc(func(r *http.Request) (*http.Response, error) {
+				switch r.URL.Path {
+				case "/v8/management/plugins":
+					return response(200, `{"plugins":[{"id":"cpa-auto-priority","effective_enabled":true}]}`), nil
+				case "/v8/management/credentials":
+					return response(200, `{"observed_at":"2026-10-04T00:00:00Z","files":[]}`), nil
+				default:
+					t.Errorf("unexpected operation: %s", r.URL.Path)
+					return response(500, `{}`), nil
+				}
+			})})
+			defer p.stop()
+			err := p.configure(lifecycle(tc.config))
+			if !tc.ok {
+				if err == nil || err.Error() != "invalid_plugin_config" {
+					t.Fatalf("typo accepted: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			clock.Await(t)
+			if state := p.getStatus(); state.Phase != "empty" {
+				t.Fatalf("store record blocked the round: %+v", state)
+			}
+		})
+	}
+}

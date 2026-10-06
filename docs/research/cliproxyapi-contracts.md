@@ -31,6 +31,8 @@
 
 `host.http.do` 不自动继承某个 auth 的独立 proxy；后台查询额度时不能假定每账号代理已得到应用。[HTTP 调度](https://github.com/router-for-me/CLIProxyAPI/blob/8ef43e4df3b216a42493105d31c2873b69191473/internal/pluginhost/host_callbacks.go#L204-L219)、[代理选用](https://github.com/router-for-me/CLIProxyAPI/blob/8ef43e4df3b216a42493105d31c2873b69191473/internal/pluginhost/http_bridge.go#L217-L234)。
 
+插件配置以 `config_yaml` 下发：宿主复制 `plugins.configs.<id>` 的原始映射，只强制写入 `enabled` 与 `priority`，其余键原样传给插件。[配置下发](https://github.com/router-for-me/CLIProxyAPI/blob/8ef43e4df3b216a42493105d31c2873b69191473/internal/pluginhost/config.go#L81-L88)、[规范化](https://github.com/router-for-me/CLIProxyAPI/blob/8ef43e4df3b216a42493105d31c2873b69191473/internal/pluginhost/config.go#L157-L168)。从插件商店安装时，宿主还会写入 `enabled: true` 和 `store:`（`pluginstore.Manifest` 的 YAML：`id`、`name`、`version`、`release-tag`、`repository`、`source-*`、`install` 等），因此插件必须接受 `store` 键。[写入](https://github.com/router-for-me/CLIProxyAPI/blob/8ef43e4df3b216a42493105d31c2873b69191473/internal/api/handlers/management/plugin_store.go#L490-L515)、[Manifest 字段](https://github.com/router-for-me/CLIProxyAPI/blob/8ef43e4df3b216a42493105d31c2873b69191473/internal/pluginstore/manifest.go#L9-L26)。宿主用 `store.version`（缺失时用 `release-tag`）选择要加载的版本化插件文件，插件本身不需要读取它。[版本选择](https://github.com/router-for-me/CLIProxyAPI/blob/8ef43e4df3b216a42493105d31c2873b69191473/internal/pluginhost/config.go#L109-L118)。
+
 ## 周额度与重置卡数据来源
 
 额度来源依据官方管理界面提交 [`ee79a794526a30c03748a8864a9ac6589a31833b`](https://github.com/router-for-me/Cli-Proxy-API-Management-Center/tree/ee79a794526a30c03748a8864a9ac6589a31833b)。以下是该界面实现的上游接口契约，不代表每个用户账号都会返回相应字段；尚未使用真实账号调用这些接口。

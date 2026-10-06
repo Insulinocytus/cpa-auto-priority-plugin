@@ -19,12 +19,20 @@ import (
 const statusPath = "/auto-priority/status"
 
 type pluginConfig struct {
-	Enabled         bool   `yaml:"enabled"`
-	Priority        int    `yaml:"priority"`
-	Cron            string `yaml:"cron"`
-	Timezone        string `yaml:"timezone"`
+	Enabled         bool      `yaml:"enabled"`
+	Priority        int       `yaml:"priority"`
+	Cron            string    `yaml:"cron"`
+	Timezone        string    `yaml:"timezone"`
+	Store           hostOwned `yaml:"store"`
 	priority.Config `yaml:",inline"`
 }
+
+// hostOwned accepts a key the pinned host writes into plugin config (the
+// plugin-store install record) without validating or retaining it, so
+// pluginConfig stays comparable and other unknown keys still fail.
+type hostOwned struct{}
+
+func (*hostOwned) UnmarshalYAML(*yaml.Node) error { return nil }
 
 type status struct {
 	Phase string          `json:"phase"`
@@ -288,7 +296,7 @@ func registration() any {
 	return map[string]any{
 		"schema_version": 6,
 		"metadata": map[string]any{
-			"Name": priority.PluginID, "Version": "0.1.0", "Author": "Insulinocytus", "GitHubRepository": "https://github.com/Insulinocytus/cpa-auto-priority-plugin",
+			"Name": priority.PluginID, "Version": "0.1.1", "Author": "Insulinocytus", "GitHubRepository": "https://github.com/Insulinocytus/cpa-auto-priority-plugin",
 			"ConfigFields": []any{
 				map[string]string{"Name": "management_url", "Type": "string", "Description": "This host's management origin; HTTPS is required off loopback."},
 				map[string]string{"Name": "management_key", "Type": "string", "Description": "Explicit management key; protect the host configuration file."},

@@ -87,15 +87,15 @@ Codex 和 Claude 的重置卡查询失败或详情不完整时，该认证文件
 ```sh
 # Linux amd64（arm64 把两处 amd64 都换成 arm64）
 PLUGIN_DIR=/path/to/cliproxyapi/plugins/linux/amd64
-curl -LO https://github.com/Insulinocytus/cpa-auto-priority-plugin/releases/download/v0.1.0/cpa-auto-priority_0.1.0_linux_amd64.zip
+curl -LO https://github.com/Insulinocytus/cpa-auto-priority-plugin/releases/download/v0.1.1/cpa-auto-priority_0.1.1_linux_amd64.zip
 mkdir -p "$PLUGIN_DIR"
-unzip -o cpa-auto-priority_0.1.0_linux_amd64.zip -d "$PLUGIN_DIR"
+unzip -o cpa-auto-priority_0.1.1_linux_amd64.zip -d "$PLUGIN_DIR"
 ```
 
 ```powershell
 # Windows amd64（arm64 把两处 amd64 都换成 arm64）
 $PluginDir = 'C:\path\to\cliproxyapi\plugins\windows\amd64'
-Invoke-WebRequest -OutFile plugin.zip https://github.com/Insulinocytus/cpa-auto-priority-plugin/releases/download/v0.1.0/cpa-auto-priority_0.1.0_windows_amd64.zip
+Invoke-WebRequest -OutFile plugin.zip https://github.com/Insulinocytus/cpa-auto-priority-plugin/releases/download/v0.1.1/cpa-auto-priority_0.1.1_windows_amd64.zip
 Expand-Archive -Force plugin.zip $PluginDir
 ```
 
@@ -107,8 +107,8 @@ Expand-Archive -Force plugin.zip $PluginDir
 # Linux amd64（macOS 把 linux/amd64 换成 darwin/arm64 等，扩展名改为 .dylib）
 PLUGIN_DIR=/path/to/cliproxyapi/plugins/linux/amd64
 mkdir -p "$PLUGIN_DIR"
-CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o "$PLUGIN_DIR/cpa-auto-priority-v0.1.0.so" ./cmd/plugin
-rm "$PLUGIN_DIR/cpa-auto-priority-v0.1.0.h"
+CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o "$PLUGIN_DIR/cpa-auto-priority-v0.1.1.so" ./cmd/plugin
+rm "$PLUGIN_DIR/cpa-auto-priority-v0.1.1.h"
 ```
 
 ```powershell
@@ -116,8 +116,8 @@ rm "$PLUGIN_DIR/cpa-auto-priority-v0.1.0.h"
 $PluginDir = 'C:\path\to\cliproxyapi\plugins\windows\amd64'
 New-Item -ItemType Directory -Force $PluginDir | Out-Null
 $env:CGO_ENABLED = '1'
-go build -trimpath -buildmode=c-shared -o "$PluginDir\cpa-auto-priority-v0.1.0.dll" ./cmd/plugin
-Remove-Item "$PluginDir\cpa-auto-priority-v0.1.0.h"
+go build -trimpath -buildmode=c-shared -o "$PluginDir\cpa-auto-priority-v0.1.1.dll" ./cmd/plugin
+Remove-Item "$PluginDir\cpa-auto-priority-v0.1.1.h"
 ```
 
 `go build -buildmode=c-shared` 会额外生成一个 `.h` 头文件，宿主用不到，可以删除。
@@ -149,7 +149,7 @@ plugins:
 | `cron` | 标准 5 段 cron，默认 `0 0 * * *`，例如 `*/30 * * * *` 表示每半小时。不支持秒字段、`@daily` / `@every`、`?` 及内嵌时区。 |
 | `timezone` | IANA 时区名，例如 `Asia/Shanghai`、`UTC`。 |
 
-除上表和 `enabled`、`priority` 外，配置中出现其他字段会导致 `invalid_plugin_config`。
+除上表和 `enabled`、`priority` 外，配置中出现其他字段会导致 `invalid_plugin_config`。唯一的例外是 `store`：从插件商店安装时宿主会写入这段安装记录，插件会忽略它。
 
 > [!IMPORTANT]
 > 原生插件在宿主进程内运行，拥有和宿主相同的权限，请只加载自己信任的构建产物。配置文件里有明文 management key，请妥善保护，不要提交到版本库。插件不跟随重定向，`management_url` 必须能直接访问。
