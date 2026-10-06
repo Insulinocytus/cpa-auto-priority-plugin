@@ -1,0 +1,71 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: go test -race ./...
+
+  build:
+    needs: check
+    # Branch pushes only run check; tags, PRs and manual runs build packages.
+    if: github.event_name != 'push' || startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - name: Build and package
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION=dev; fi
+          mkdir -p dist
+          # Linux targets pin glibc 2.17, matching upstream CLIProxyAPI Linux releases.
+          for target in linux/amd64/so/x86_64-linux-gnu.2.17 linux/arm64/so/aarch64-linux-gnu.2.17 \
+                        windows/amd64/dll/x86_64-windows-gnu windows/arm64/dll/aarch64-windows-gnu; do
+            IFS=/ read -r goos goarch ext zigtarget <<< "$target"
+            out="build/${goos}_${goarch}/cpa-auto-priority.${ext}"
+            CGO_ENABLED=1 GOOS=$goos GOARCH=$goarch CC="zig cc -target $zigtarget" \
+              go build -trimpath -buildmode=c-shared -ldflags "-s -w -X main.pluginVersion=$VERSION" -o "$out" ./cmd/plugin
+            zip -j -X "dist/cpa-auto-priority_${VERSION}_${goos}_${goarch}.zip" "$out"
+          done
+          (cd dist && sha256sum *.zip > checksums.txt)
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cpa-auto-priority
+          path: dist/
+          if-no-files-found: error
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # SemVer pre-release tags (v1.2.3-rc.1) publish as pre-releases.
+          prerelease=()
+          [[ "$GITHUB_REF_NAME" == *-* ]] && prerelease=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --verify-tag --title "$GITHUB_REF_NAME" --generate-notes "${prerelease[@]}"

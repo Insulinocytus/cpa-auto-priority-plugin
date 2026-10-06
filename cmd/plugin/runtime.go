@@ -18,6 +18,9 @@ import (
 
 const statusPath = "/auto-priority/status"
 
+// pluginVersion is set by release builds via -ldflags "-X main.pluginVersion=<version>".
+var pluginVersion = "dev"
+
 type pluginConfig struct {
 	Enabled         bool      `yaml:"enabled"`
 	Priority        int       `yaml:"priority"`
@@ -296,7 +299,7 @@ func registration() any {
 	return map[string]any{
 		"schema_version": 6,
 		"metadata": map[string]any{
-			"Name": priority.PluginID, "Version": "0.1.1", "Author": "Insulinocytus", "GitHubRepository": "https://github.com/Insulinocytus/cpa-auto-priority-plugin",
+			"Name": priority.PluginID, "Version": pluginVersion, "Author": "Insulinocytus", "GitHubRepository": "https://github.com/Insulinocytus/cpa-auto-priority-plugin",
 			"ConfigFields": []any{
 				map[string]string{"Name": "management_url", "Type": "string", "Description": "This host's management origin; HTTPS is required off loopback."},
 				map[string]string{"Name": "management_key", "Type": "string", "Description": "Explicit management key; protect the host configuration file."},

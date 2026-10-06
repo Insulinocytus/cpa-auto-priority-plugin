@@ -65,7 +65,7 @@ gofmt -l .             # 应无输出
 go build -buildmode=c-shared -o cpa-auto-priority.dll ./cmd/plugin   # Linux 用 .so，macOS 用 .dylib
 ```
 
-- 仓库里没有 Makefile、CI 或 golangci 配置。
+- 发版：推 `v<SemVer>` 标签，`.github/workflows/build.yml` 用 zig 交叉编译 linux（glibc 2.17）/windows 的 amd64/arm64、打包并发布 Release；带 `-` 的标签发 pre-release。版本只来自标签（`-X main.pluginVersion`），本地构建为 `dev`。
 - host 从文件名推导插件 ID，可带可选的 `-v<version>` 后缀，例如 `cpa-auto-priority-v0.1.0.so`。host 扫描 `plugins/<GOOS>/<GOARCH>/` 和 `plugins/`。
 - `go build -buildmode=c-shared` 还会生成一个 `.h`。`.gitignore` 不会忽略它，所以产物要输出到仓库外。
 - `cmd/plugin` 依赖 cgo，所以对该包执行 vet/test 也需要 C 工具链。
@@ -117,7 +117,7 @@ go build -buildmode=c-shared -o cpa-auto-priority.dll ./cmd/plugin   # Linux 用
   - 响应用 `C.CBytes` 分配，由 host 通过 `cliproxyPluginFree` 释放。
 - `cmd/plugin/runtime.go`：
   - `pluginRuntime.configure/run/stop/handle`。
-  - `registration()`：schema_version 6，Version `0.1.1`。
+  - `registration()`：schema_version 6，Version 取 `pluginVersion`。
   - `parseSchedule`。
 - `sync.go`：
   - `New(config, client, now)`：HTTP 和观测时间是仅有的两个注入点。

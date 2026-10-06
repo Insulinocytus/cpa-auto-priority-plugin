@@ -86,16 +86,18 @@ Codex 和 Claude 的重置卡查询失败或详情不完整时，该认证文件
 
 ```sh
 # Linux amd64（arm64 把两处 amd64 都换成 arm64）
+VERSION=0.1.1
 PLUGIN_DIR=/path/to/cliproxyapi/plugins/linux/amd64
-curl -LO https://github.com/Insulinocytus/cpa-auto-priority-plugin/releases/download/v0.1.1/cpa-auto-priority_0.1.1_linux_amd64.zip
+curl -LO "https://github.com/Insulinocytus/cpa-auto-priority-plugin/releases/download/v$VERSION/cpa-auto-priority_${VERSION}_linux_amd64.zip"
 mkdir -p "$PLUGIN_DIR"
-unzip -o cpa-auto-priority_0.1.1_linux_amd64.zip -d "$PLUGIN_DIR"
+unzip -o "cpa-auto-priority_${VERSION}_linux_amd64.zip" -d "$PLUGIN_DIR"
 ```
 
 ```powershell
 # Windows amd64（arm64 把两处 amd64 都换成 arm64）
+$Version = '0.1.1'
 $PluginDir = 'C:\path\to\cliproxyapi\plugins\windows\amd64'
-Invoke-WebRequest -OutFile plugin.zip https://github.com/Insulinocytus/cpa-auto-priority-plugin/releases/download/v0.1.1/cpa-auto-priority_0.1.1_windows_amd64.zip
+Invoke-WebRequest -OutFile plugin.zip "https://github.com/Insulinocytus/cpa-auto-priority-plugin/releases/download/v$Version/cpa-auto-priority_${Version}_windows_amd64.zip"
 Expand-Archive -Force plugin.zip $PluginDir
 ```
 
@@ -105,22 +107,24 @@ Expand-Archive -Force plugin.zip $PluginDir
 
 ```sh
 # Linux amd64（macOS 把 linux/amd64 换成 darwin/arm64 等，扩展名改为 .dylib）
+VERSION=0.1.1
 PLUGIN_DIR=/path/to/cliproxyapi/plugins/linux/amd64
 mkdir -p "$PLUGIN_DIR"
-CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o "$PLUGIN_DIR/cpa-auto-priority-v0.1.1.so" ./cmd/plugin
-rm "$PLUGIN_DIR/cpa-auto-priority-v0.1.1.h"
+CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -ldflags "-X main.pluginVersion=$VERSION" -o "$PLUGIN_DIR/cpa-auto-priority-v$VERSION.so" ./cmd/plugin
+rm "$PLUGIN_DIR/cpa-auto-priority-v$VERSION.h"
 ```
 
 ```powershell
 # Windows amd64（PowerShell）
+$Version = '0.1.1'
 $PluginDir = 'C:\path\to\cliproxyapi\plugins\windows\amd64'
 New-Item -ItemType Directory -Force $PluginDir | Out-Null
 $env:CGO_ENABLED = '1'
-go build -trimpath -buildmode=c-shared -o "$PluginDir\cpa-auto-priority-v0.1.1.dll" ./cmd/plugin
-Remove-Item "$PluginDir\cpa-auto-priority-v0.1.1.h"
+go build -trimpath -buildmode=c-shared -ldflags "-X main.pluginVersion=$Version" -o "$PluginDir\cpa-auto-priority-v$Version.dll" ./cmd/plugin
+Remove-Item "$PluginDir\cpa-auto-priority-v$Version.h"
 ```
 
-`go build -buildmode=c-shared` 会额外生成一个 `.h` 头文件，宿主用不到，可以删除。
+`go build -buildmode=c-shared` 会额外生成一个 `.h` 头文件，宿主用不到，可以删除。`VERSION` 用于文件名和插件上报给宿主的版本，自行构建时可以填任意合法版本号；不传 `-ldflags` 时版本为 `dev`。
 
 ### 2. 配置宿主
 
