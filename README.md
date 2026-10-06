@@ -249,7 +249,7 @@ go vet ./...
 gofmt -l .           # 应无输出
 ```
 
-`cmd/plugin` 依赖 cgo，对它运行 test / vet 同样需要 C 编译器。
+`cmd/plugin` 依赖 cgo，对它运行 test / vet 同样需要 C 编译器。仓库用 [mise](https://mise.jdx.dev) 固定 Go 与 zig 版本（`mise.toml`），执行 `mise install` 即可得到与 CI 相同的工具链。
 
 - [术语表](GLOSSARY.md)：认证文件、额度周期、排序时间等领域词汇的定义。
 - [CLIProxyAPI 接口调查](docs/research/cliproxyapi-contracts.md)：宿主与各 Provider 的接口契约，修改同步逻辑或 Provider 前必读。

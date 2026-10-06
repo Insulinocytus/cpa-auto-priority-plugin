@@ -131,8 +131,8 @@ go build -buildmode=c-shared -o cpa-auto-priority.dll ./cmd/plugin   # Linux 用
 
 ## Runtime/Tooling Preferences
 
-- Go 1.25（`go.mod`），代码用到了 `for range N`、`min` 和泛型。依赖只有 `gopkg.in/yaml.v3` 和 `github.com/robfig/cron/v3`，新增依赖前先确认标准库做不到。
-- 需要 cgo 和 C 编译器。产物要与 host 的 GOOS/GOARCH 一致，交叉编译需要对应的交叉 C 编译器。
+- 工具链由 `mise.toml` 固定（Go、zig），本地与 CI（`jdx/mise-action`）一致；`go.mod` 的 `go 1.25.0` 是最低语言版本。代码用到了 `for range N`、`min` 和泛型。依赖只有 `gopkg.in/yaml.v3` 和 `github.com/robfig/cron/v3`，新增依赖前先确认标准库做不到。
+- 需要 cgo 和 C 编译器。产物要与 host 的 GOOS/GOARCH 一致；交叉编译用 `CC="zig cc -target <triple>"`，triple 以 workflow 为准。
 - 文档用简体中文，标识符用英文。
 
 ## Testing & QA
