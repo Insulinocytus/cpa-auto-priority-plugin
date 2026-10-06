@@ -48,8 +48,11 @@ jobs:
                         windows/amd64/dll/x86_64-windows-gnu windows/arm64/dll/aarch64-windows-gnu; do
             IFS=/ read -r goos goarch ext zigtarget <<< "$target"
             out="build/${goos}_${goarch}/cpa-auto-priority.${ext}"
+            # cgo's export header re-declares main.go's externs with dllexport; harmless.
             CGO_ENABLED=1 GOOS=$goos GOARCH=$goarch CC="zig cc -target $zigtarget" \
+              CGO_CFLAGS="-O2 -g -Wno-dll-attribute-on-redeclaration" \
               go build -trimpath -buildmode=c-shared -ldflags "-s -w -X main.pluginVersion=$VERSION" -o "$out" ./cmd/plugin
+            chmod 755 "$out"
             zip -j -X "dist/cpa-auto-priority_${VERSION}_${goos}_${goarch}.zip" "$out"
           done
           (cd dist && sha256sum *.zip > checksums.txt)
